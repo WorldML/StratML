@@ -46,7 +46,10 @@ def run_pipeline(args) -> None:
     grid.add_column(style="dim"); grid.add_column()
     grid.add_row("Mode",    f"[bold]{config['mode']}[/bold]")
     grid.add_row("Dataset", f"[white]{d['path']}[/white]")
-    grid.add_row("Budget",  f"[bold]{e['max_iterations']}[/bold] iterations")
+    tune_active = e.get("tune", False)
+    budget_desc = f"[bold]{e['max_iterations']}[/bold] iterations"
+    budget_desc += " [yellow](tune=True: Exploratory)[/yellow]" if tune_active else " [green](tune=False: Paper Standard)[/green]"
+    grid.add_row("Budget",  budget_desc)
     _console.print(grid)
     _console.print()
 
@@ -115,7 +118,7 @@ def run_pipeline(args) -> None:
         llm_mode=config.get("llm_mode", e.get("llm_mode")),
     )
 
-    ExecutionOrchestrator(
+    orchestrator = ExecutionOrchestrator(
         send_profile=engine.receive_profile,
         send_result=engine.receive_result,
         split_config=SplitConfig(
@@ -127,16 +130,32 @@ def run_pipeline(args) -> None:
         run_id=run_id,
         log=_console.print,
         tune=config.get("execution", {}).get("tune", False),
-    ).run(d["path"], d["target_column"])
+        max_iterations=e.get("max_iterations", 5),
+    )
+    orchestrator.run(d["path"], d["target_column"])
 
     _console.print()
     _console.rule("[bold green]Run Complete[/bold green]", style="green")
     _console.print()
     footer = Table.grid(padding=(0, 3))
-    footer.add_column(style="dim", width=12); footer.add_column(style="white")
-    footer.add_row("Run ID",  f"[bold]{run_id}[/bold]")
-    footer.add_row("Output",  str(out_dir))
+    footer.add_column(style="dim", width=18); footer.add_column(style="white")
+    footer.add_row("Run ID",     f"[bold]{run_id}[/bold]")
+    footer.add_row("Output",     str(out_dir))
+    footer.add_row("Iterations", f"{orchestrator.decision_iterations} / {e['max_iterations']}")
+    footer.add_row(
+        "Model Fits",
+        f"{orchestrator.actual_fits} ({'Tuned' if orchestrator.tune else 'Paper Standard'})",
+    )
+    footer.add_row(
+        "Runtime",
+        f"{orchestrator.total_runtime:.2f}s (Timeout: {e.get('timeout_per_run')}s, soft)",
+    )
     _console.print(footer)
+    if orchestrator.tune:
+        _console.print(
+            "  [yellow]Notice:[/yellow] Run executed with `--tune` (exploratory tuning). "
+            "Target paper budget is `tune: false`.\n"
+        )
     _console.print()
 
     _generate_report(run_id, dataset_name, out_dir)

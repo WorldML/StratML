@@ -14,7 +14,7 @@ from copy import deepcopy
 DEFAULT_CONFIG: dict = {
     "mode": "beginner",
     "dataset": {"path": None, "target_column": None},
-    "execution": {"max_iterations": 5, "timeout_per_run": 300, "random_seed": 42},
+    "execution": {"max_iterations": 5, "timeout_per_run": 300, "random_seed": 42, "tune": False},
     "split": {"method": "stratified", "test_size": 0.2},
     "logging": {"enable_mlflow": False, "enable_tensorboard": False, "log_level": "info"},
     "constraints": {"max_memory": None, "max_cpu": None},

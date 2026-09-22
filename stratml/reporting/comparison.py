@@ -51,6 +51,10 @@ def write_comparison(records: list[dict], output_dir: Path) -> None:
 
     (output_dir / "comparison.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
 
+    budget_artifact = output_dir / "artifacts" / "budget_accounting.json"
+    if budget_artifact.exists():
+        (output_dir / "budget_accounting.json").write_text(budget_artifact.read_text(encoding="utf-8"), encoding="utf-8")
+
 
 def generate_model_script(run_id: str, output_dir: Path, records: list[dict]) -> Path:
     """Generate a standalone model.py that loads and uses the best model."""

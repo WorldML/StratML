@@ -107,9 +107,23 @@ def _build_pdf(
     story.append(HRFlowable(width="100%", thickness=1, color=colors.grey, spaceAfter=8))
 
     # Summary
-    story.append(Paragraph("Summary", h2))
+    story.append(Paragraph("Summary & Computational Budget", h2))
     story.append(Paragraph(f"Iterations logged: <b>{len(records)}</b>", bod))
     story.append(Paragraph(f"Output directory: <font name='Courier'>{output_dir}</font>", bod))
+    budget_file = output_dir / "artifacts" / "budget_accounting.json"
+    if budget_file.exists():
+        try:
+            bdata = json.loads(budget_file.read_text(encoding="utf-8"))
+            act = bdata.get("actual_consumption", {})
+            cfg = bdata.get("configured_budget", {})
+            comp = bdata.get("paper_compliance", {})
+            story.append(Paragraph(f"Model Fits / Evaluations: <b>{act.get('model_fits', len(records))}</b>", bod))
+            story.append(Paragraph(f"Total Runtime: <b>{act.get('runtime_seconds', 0):.2f}s</b> (Timeout: {cfg.get('timeout_per_run_seconds')}s, soft boundary)", bod))
+            is_paper = comp.get("is_paper_standard", True)
+            b_label = "Paper Standard (tune=False)" if is_paper else "Exploratory Tuned (tune=True - NON-PAPER)"
+            story.append(Paragraph(f"Budget Mode: <b>{b_label}</b>", bod))
+        except Exception:
+            pass
 
     # Iteration comparison table
     story.append(Paragraph("Iteration Comparison", h2))

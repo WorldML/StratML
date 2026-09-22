@@ -119,8 +119,64 @@ def _build_kpi(best, cell_s):
         ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
         ("LEFTPADDING",   (0, 0), (-1, -1), 10),
         ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
     ]))
     return t
+
+
+def _build_budget_card(output_dir: Path, records: list[dict], cell_s):
+    import json
+    budget_file = output_dir / "artifacts" / "budget_accounting.json"
+    bdata = None
+    if budget_file.exists():
+        try:
+            bdata = json.loads(budget_file.read_text(encoding="utf-8"))
+        except Exception:
+            bdata = None
+
+    if bdata:
+        cfg = bdata.get("configured_budget", {})
+        act = bdata.get("actual_consumption", {})
+        comp = bdata.get("paper_compliance", {})
+        iters = act.get("decision_iterations", len(records))
+        fits = act.get("model_fits", len(records))
+        runtime = act.get("runtime_seconds", sum(r.get("state_snapshot", {}).get("resources", {}).get("runtime", 0) for r in records))
+        is_paper = comp.get("is_paper_standard", True)
+        timeout_val = cfg.get("timeout_per_run_seconds")
+    else:
+        iters = len(records)
+        fits = len(records)
+        runtime = sum(r.get("state_snapshot", {}).get("resources", {}).get("runtime", 0) for r in records)
+        is_paper = True
+        timeout_val = 300
+
+    profile_label = "Paper Standard (tune=False)" if is_paper else "Exploratory (tune=True)"
+    profile_color = "#16a34a" if is_paper else "#d97706"
+
+    t = Table([[
+        Paragraph('<font color="#64748b" size="7">DECISION ITERATIONS</font><br/>'
+                  f'<font color="#1a2744" size="12"><b>{iters}</b></font>', cell_s),
+        Paragraph('<font color="#64748b" size="7">MODEL FITS / EVALS</font><br/>'
+                  f'<font color="#1a2744" size="12"><b>{fits}</b></font>', cell_s),
+        Paragraph('<font color="#64748b" size="7">TOTAL RUNTIME</font><br/>'
+                  f'<font color="#1a2744" size="12"><b>{runtime:.2f}s</b></font><br/>'
+                  f'<font color="#64748b" size="6.5">Timeout: {timeout_val}s (soft)</font>', cell_s),
+        Paragraph('<font color="#64748b" size="7">BUDGET PROFILE</font><br/>'
+                  f'<font color="{profile_color}" size="8.5"><b>{profile_label}</b></font>', cell_s),
+    ]], colWidths=[4.2*cm, 4.2*cm, 4.2*cm, 4.2*cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, -1), ALT),
+        ("BOX",           (0, 0), (0, -1),  0.5, BORDER),
+        ("BOX",           (1, 0), (1, -1),  0.5, BORDER),
+        ("BOX",           (2, 0), (2, -1),  0.5, BORDER),
+        ("BOX",           (3, 0), (3, -1),  0.5, BORDER),
+        ("TOPPADDING",    (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    return t, bdata
 
 
 def _build_dataset(ds):
@@ -516,7 +572,22 @@ def build_pdf(
     story.append(Paragraph("Experiment Report", st["sub"]))
     story.append(HRFlowable(width="100%", thickness=2, color=BLUE, spaceAfter=8))
     story.append(_build_header(run_id, dataset_name, len(records)))
-    story.append(Spacer(1, 0.5*cm))
+    story.append(Spacer(1, 0.35*cm))
+
+    # ── Computational Budget ──────────────────────────────────────────────────
+    budget_card, bdata = _build_budget_card(output_dir, records, st["cell"])
+    story.append(budget_card)
+    story.append(Spacer(1, 0.35*cm))
+
+    if bdata and not bdata.get("paper_compliance", {}).get("is_paper_standard", True):
+        story.append(Paragraph(
+            "<font color='#d97706'><b>Budget Boundary Note:</b></font> "
+            "This experiment executed with hyperparameter tuning enabled (<b>--tune</b>), "
+            "which evaluates multiple candidates per iteration via cross-validation. "
+            "The target paper budget configuration is <b>max_iterations: 5, tune: false</b>.",
+            st["cell"]
+        ))
+        story.append(Spacer(1, 0.3*cm))
 
     # ── KPI cards ─────────────────────────────────────────────────────────────
     if records:

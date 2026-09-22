@@ -111,6 +111,8 @@ class MLPipelineResult:
     train_curve: list[float]
     val_curve: list[float]
     runtime: float
+    fit_count: int = 1
+    eval_count: int = 1
 
 
 def run_ml_pipeline(config: ExperimentConfig, data_split: DataSplit) -> MLPipelineResult:
@@ -141,9 +143,24 @@ def run_ml_pipeline(config: ExperimentConfig, data_split: DataSplit) -> MLPipeli
         )
         search.fit(data_split.X_train, data_split.y_train)
         model = search.best_estimator_
+
+        # Record actual fits performed across CV folds + refit
+        cv_results = getattr(search, "cv_results_", None)
+        if isinstance(cv_results, dict) and "params" in cv_results:
+            n_candidates = len(cv_results["params"])
+        elif isinstance(getattr(search, "n_iter", None), int):
+            n_candidates = search.n_iter
+        else:
+            n_candidates = 10
+        n_splits = search.n_splits_ if isinstance(getattr(search, "n_splits_", None), int) else 3
+        refit_count = 1 if getattr(search, "refit", True) else 0
+        fit_count = (n_candidates * n_splits) + refit_count
+        eval_count = n_candidates
     else:
         model = cls(**hp)
         model.fit(data_split.X_train, data_split.y_train)
+        fit_count = 1
+        eval_count = 1
 
     runtime = round(time.perf_counter() - t0, 4)
     y_val_pred = model.predict(data_split.X_val)
@@ -162,4 +179,6 @@ def run_ml_pipeline(config: ExperimentConfig, data_split: DataSplit) -> MLPipeli
         train_curve=[train_loss],
         val_curve=[val_loss],
         runtime=runtime,
+        fit_count=fit_count,
+        eval_count=eval_count,
     )

@@ -54,6 +54,7 @@ class ExecutionOrchestrator:
         log: Optional[Callable[[str], None]] = None,
         enable_mlflow: bool = False,
         tune: bool = False,
+        max_iterations: int | None = None,
     ) -> None:
         self.send_profile  = send_profile
         self.send_result   = send_result
@@ -63,6 +64,12 @@ class ExecutionOrchestrator:
         self.log           = log or (lambda msg: None)
         self.enable_mlflow = enable_mlflow
         self.tune          = tune
+        self.max_iterations = max_iterations if max_iterations is not None else 5
+        self.decision_iterations = 0
+        self.actual_fits = 0
+        self.actual_evaluations = 0
+        self.total_runtime = 0.0
+        self.budget_accounting: dict = {}
 
     def run(self, dataset_path: str, target_column: str) -> None:
         # ── Phase 1+2: Ingest and profile ────────────────────────────────────
@@ -87,7 +94,12 @@ class ExecutionOrchestrator:
         # ── Send DataProfile to Team B, receive first ActionDecision ─────────
         self.log("  Sending profile to Decision Engine...")
         action: ActionDecision = self.send_profile(profile)
-        self.log(f"  Decision [iter 0]: action={action.action_type} | params={action.parameters} | trigger={action.reason.trigger}")
+        trigger_iter0 = (
+            action.reason.trigger
+            if hasattr(action.reason, "trigger")
+            else (action.reason.get("trigger", str(action.reason)) if isinstance(action.reason, dict) else str(action.reason))
+        )
+        self.log(f"  Decision [iter 0]: action={action.action_type} | params={action.parameters} | trigger={trigger_iter0}")
 
         iteration     = 0
         total_runtime = 0.0
@@ -130,11 +142,17 @@ class ExecutionOrchestrator:
                 dl_result = pipeline_result
             run_time = round(time.perf_counter() - t_start, 4)
             total_runtime += run_time
+            self.total_runtime = total_runtime
+            self.decision_iterations = iteration
+            fits_this_iter = getattr(pipeline_result, "fit_count", 1)
+            evals_this_iter = getattr(pipeline_result, "eval_count", 1)
+            self.actual_fits += fits_this_iter
+            self.actual_evaluations += evals_this_iter
 
             dl_info = ""
             if dl_result is not None:
                 dl_info = f" | device={dl_result.device_used} | epochs={dl_result.epochs_run} | early_stopped={dl_result.early_stopped}"
-            self.log(f"  Trained in {run_time:.2f}s{dl_info}")
+            self.log(f"  Trained in {run_time:.2f}s (fits={fits_this_iter}){dl_info}")
 
             # ── Phase 6: Metrics ──────────────────────────────────────────────
             metrics = compute_metrics(
@@ -203,15 +221,24 @@ class ExecutionOrchestrator:
                 best_epoch=dl_result.best_epoch if dl_result else None,
             )
 
-            # ── Budget check ──────────────────────────────────────────────────
+            # ── Budget check (soft timeout) ───────────────────────────────────
             if self.time_budget and total_runtime >= self.time_budget:
+                self.log(
+                    f"  [Budget] Soft timeout reached: runtime {total_runtime:.2f}s >= budget {self.time_budget:.2f}s. "
+                    f"Completed iteration {iteration} cleanly without interrupting in-flight fit."
+                )
                 break
 
             # ── Send result to Team B, receive next ActionDecision ────────────
             self.log(f"  Result   : primary={primary:.4f} | runtime={run_time:.2f}s")
             self.log("  Evaluating signals & deciding next action...")
             action = self.send_result(result)
-            self.log(f"  Decision : {action.action_type} | trigger={action.reason.trigger} | confidence={action.confidence:.2f} | next={action.parameters}")
+            trigger_next = (
+                action.reason.trigger
+                if hasattr(action.reason, "trigger")
+                else (action.reason.get("trigger", str(action.reason)) if isinstance(action.reason, dict) else str(action.reason))
+            )
+            self.log(f"  Decision : {action.action_type} | trigger={trigger_next} | confidence={action.confidence:.2f} | next={action.parameters}")
 
         # ── Test set evaluation ──────────────────────────────────────────────
         self.log(f"\n  --- Test Set Evaluation (Best Validation Score: {best_val_score:.4f} from Iteration {best_iteration}) ---")
@@ -291,3 +318,42 @@ class ExecutionOrchestrator:
                     self.log(f"  DL test set evaluation failed: {exc}")
         else:
             self.log("  Skipped test set evaluation (no trained model).")
+
+        # ── Computational Budget Accounting ──────────────────────────────────
+        import json
+        artifacts_dir = Path("outputs") / self.run_id / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        budget_accounting = {
+            "run_id": self.run_id,
+            "configured_budget": {
+                "max_iterations": self.max_iterations,
+                "timeout_per_run_seconds": self.time_budget,
+                "tune": self.tune,
+                "budget_type": "exploratory_tuned" if self.tune else "paper_standard",
+                "timeout_semantics": "soft_boundary (in-progress iteration completes fully before timeout is enforced at iteration boundary)",
+            },
+            "actual_consumption": {
+                "decision_iterations": self.decision_iterations,
+                "model_evaluations": self.actual_evaluations,
+                "model_fits": self.actual_fits,
+                "runtime_seconds": round(self.total_runtime, 4),
+                "timeout_triggered": bool(self.time_budget and self.total_runtime >= self.time_budget),
+            },
+            "paper_compliance": {
+                "is_paper_standard": (not self.tune),
+                "target_paper_config": {
+                    "max_iterations": 5,
+                    "tune": False,
+                },
+                "boundary_status": "COMPLIANT_PAPER_STANDARD" if not self.tune else "EXPLORATORY_TUNING_ACTIVE",
+                "warning": (
+                    f"Tuning (--tune) is enabled! This multiplies model fits per iteration ({self.actual_fits} fits vs {self.decision_iterations} iterations) "
+                    "and departs from the target paper budget (tune=false)."
+                    if self.tune else None
+                ),
+            },
+        }
+        self.budget_accounting = budget_accounting
+        budget_path = artifacts_dir / "budget_accounting.json"
+        budget_path.write_text(json.dumps(budget_accounting, indent=2))
+        self.log(f"  Computational budget accounting saved to {budget_path}")
