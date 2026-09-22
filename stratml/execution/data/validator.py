@@ -4,10 +4,29 @@ validator.py
 Phase 1 — Dataset Ingestion: validate the loaded DataFrame and build a Dataset object.
 """
 
+import hashlib
 import warnings
 
 import pandas as pd
 from stratml.execution.schemas import Dataset
+
+
+def compute_dataset_fingerprint(df: pd.DataFrame) -> str:
+    """
+    Compute a deterministic 16-hex-character content fingerprint of a pandas DataFrame.
+    Same column names, dtypes, and values produce the identical fingerprint.
+    Any change in values, row order, rows added/removed, or column names alters the fingerprint.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(str(list(df.columns)).encode("utf-8"))
+    hasher.update(str([str(dt) for dt in df.dtypes]).encode("utf-8"))
+    try:
+        row_hashes = pd.util.hash_pandas_object(df, index=False).to_numpy()
+        hasher.update(row_hashes.tobytes())
+    except Exception:
+        for col in df.columns:
+            hasher.update(str(df[col].tolist()).encode("utf-8", errors="replace"))
+    return hasher.hexdigest()[:16]
 
 
 def build_dataset(
@@ -55,6 +74,8 @@ def build_dataset(
             "not a valid ML problem."
         )
 
+    fingerprint = compute_dataset_fingerprint(df)
+
     return Dataset(
         dataset_name=dataset_name,
         rows=len(df),
@@ -62,4 +83,5 @@ def build_dataset(
         target_column=target_column,
         dataset_type="tabular",
         raw_dataframe=df,
+        dataset_fingerprint=fingerprint,
     )

@@ -72,6 +72,7 @@ def _load_training_data(
     csv_path: Path,
     current_run_id: Optional[str] = None,
     current_dataset_id: Optional[str] = None,
+    current_dataset_fingerprint: Optional[str] = None,
     history_mode: str = "all",
 ):
     """Return (X, y) arrays from the CSV, or (None, None) if insufficient data.
@@ -115,10 +116,16 @@ def _load_training_data(
         if "run_id" in df.columns and current_run_id:
             if history_mode == "independent":
                 df = df[df["run_id"] == current_run_id]
-        if "dataset_id" in df.columns and current_dataset_id:
-            if history_mode == "continual":
+
+        if history_mode == "continual":
+            if current_dataset_fingerprint and "dataset_fingerprint" in df.columns:
+                df = df[df["dataset_fingerprint"] == current_dataset_fingerprint]
+            elif "dataset_id" in df.columns and current_dataset_id:
                 df = df[df["dataset_id"] == current_dataset_id]
-            elif history_mode == "transfer":
+        elif history_mode == "transfer":
+            if current_dataset_fingerprint and "dataset_fingerprint" in df.columns:
+                df = df[df["dataset_fingerprint"] != current_dataset_fingerprint]
+            elif "dataset_id" in df.columns and current_dataset_id:
                 df = df[df["dataset_id"] != current_dataset_id]
 
         if len(df) < _MIN_ROWS:
@@ -129,14 +136,17 @@ def _load_training_data(
             "steps_since_improvement", "num_samples", "num_features",
             "missing_ratio", "runtime", "remaining_budget",
         ]
-        df["action_type_enc"] = df["action_type"].map(_ACTION_VOCAB).fillna(len(_ACTION_VOCAB))
-        df["model_name_enc"] = df["model_name"].map(_MODEL_VOCAB).fillna(len(_MODEL_VOCAB))
+        X_base = df[feature_cols].values
+
+        action_enc = df["action_type"].map(lambda a: float(_ACTION_VOCAB.get(a, len(_ACTION_VOCAB)))).values
+        model_enc = df["model_name"].map(lambda m: float(_MODEL_VOCAB.get(m, len(_MODEL_VOCAB)))).values
         if "complexity_hint" in df.columns:
-            df["complexity_hint_enc"] = df["complexity_hint"].map(_COMPLEXITY_VOCAB).fillna(0)
+            complexity_enc = df["complexity_hint"].map(lambda c: float(_COMPLEXITY_VOCAB.get(c, 0))).values
         else:
-            df["complexity_hint_enc"] = 0.0
-        X = df[feature_cols + ["action_type_enc", "model_name_enc", "complexity_hint_enc"]].astype(float).values
-        y = df["observed_gain"].astype(float).values
+            complexity_enc = np.zeros(len(df), dtype=float)
+
+        X = np.column_stack([X_base, action_enc, model_enc, complexity_enc])
+        y = df["observed_gain"].values
         return X, y
     except Exception as exc:
         log.warning("value_model: failed to load training data (%s)", exc)
@@ -158,17 +168,23 @@ def _encode_state_action(state: StateObject, action_type: str) -> list[float]:
     ]
 
 
-def predict(state: StateObject, candidates: list[CandidateAction]) -> list[ValuePrediction]:
+def predict(
+    state: StateObject,
+    candidates: list[CandidateAction],
+    seed: Optional[int] = None,
+) -> list[ValuePrediction]:
     """Predict (gain, cost) per candidate. Uses RF model when data is sufficient."""
     run_id = getattr(state.meta, "run_id", None)
     dataset_id = (
         getattr(state.dataset, "dataset_id", None)
         or getattr(state.dataset, "dataset_name", None)
     )
+    dataset_fingerprint = getattr(state.dataset, "dataset_fingerprint", None)
     X_train, y_train = _load_training_data(
         _DATASET_PATH,
         current_run_id=run_id,
         current_dataset_id=dataset_id,
+        current_dataset_fingerprint=dataset_fingerprint,
         history_mode=_HISTORY_MODE,
     )
 
@@ -177,7 +193,8 @@ def predict(state: StateObject, candidates: list[CandidateAction]) -> list[Value
             import numpy as np
             from sklearn.ensemble import RandomForestRegressor
 
-            rf = RandomForestRegressor(n_estimators=50, random_state=42)
+            eff_seed = seed if seed is not None else getattr(state.meta, "seed", 42)
+            rf = RandomForestRegressor(n_estimators=50, random_state=eff_seed)
             rf.fit(X_train, y_train)
 
             results = []

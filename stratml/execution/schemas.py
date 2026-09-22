@@ -22,6 +22,7 @@ class Dataset(BaseModel):
     target_column: str
     dataset_type: str = Field(..., pattern="^(tabular|text|vision)$")
     raw_dataframe: object = Field(exclude=True)
+    dataset_fingerprint: Optional[str] = None
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -50,6 +51,7 @@ class DataProfile(BaseModel):
     imbalance_ratio: Optional[float] = None       # max_class / min_class count
     feature_variance_mean: Optional[float] = None  # mean variance across numerical features
     class_entropy: Optional[float] = None          # entropy of class distribution
+    dataset_fingerprint: Optional[str] = None
 
 
 # PreprocessingConfig imported from stratml.core.schemas

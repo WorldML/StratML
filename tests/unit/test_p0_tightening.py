@@ -38,6 +38,9 @@ from stratml.decision.actions.action_generator import (
 )
 from stratml.decision.engine import DecisionEngine
 from stratml.decision.learning import dataset_builder, meta_memory, value_model
+_meta_memory = meta_memory
+from stratml.decision.learning.uncertainty import UncertaintyEstimate
+from stratml.decision.state.state_builder import build_state_from_profile
 from stratml.decision.learning.value_model import (
     _ACTION_VOCAB,
     _MODEL_VOCAB,
@@ -243,11 +246,12 @@ class TestP0_4_MetaMemoryBestModelProvenance:
     def test_metamemory_records_actual_best_model_not_last_tried(self, monkeypatch):
         recorded_calls = []
 
-        def mock_record_run(meta_features, best_model, best_score, run_id):
+        def mock_record_run(meta_features, best_model, best_score, run_id, **kwargs):
             recorded_calls.append({
                 "best_model": best_model,
                 "best_score": best_score,
                 "run_id": run_id,
+                **kwargs,
             })
 
         monkeypatch.setattr(meta_memory, "record_run", mock_record_run)
@@ -550,3 +554,322 @@ class TestP0_10_CollisionSafeRunIds:
         finally:
             for d in created_dirs:
                 shutil.rmtree(d, ignore_errors=True)
+
+
+# ===========================================================================
+# Round 2 P0 Audits: P0-1 through P0-5
+# ===========================================================================
+
+class TestRound2_P0_1_DatasetFingerprintIdentity:
+    def test_same_dataset_content_produces_identical_fingerprint(self):
+        from stratml.execution.data.validator import build_dataset, compute_dataset_fingerprint
+
+        df1 = pd.DataFrame({"a": [1.0, 2.0, 3.0], "b": [10, 20, 30], "target": [0, 1, 0]})
+        df2 = pd.DataFrame({"a": [1.0, 2.0, 3.0], "b": [10, 20, 30], "target": [0, 1, 0]})
+
+        fp1 = compute_dataset_fingerprint(df1)
+        fp2 = compute_dataset_fingerprint(df2)
+        assert fp1 == fp2
+        assert len(fp1) == 16
+
+        ds1 = build_dataset(df1, "ds_test", "target")
+        ds2 = build_dataset(df2, "ds_test", "target")
+        assert ds1.dataset_fingerprint == fp1
+        assert ds1.dataset_fingerprint == ds2.dataset_fingerprint
+
+    def test_different_dataset_content_or_version_produces_different_fingerprint(self):
+        from stratml.execution.data.validator import compute_dataset_fingerprint
+
+        df_base = pd.DataFrame({"a": [1.0, 2.0, 3.0], "b": [10, 20, 30], "target": [0, 1, 0]})
+        df_modified_val = pd.DataFrame({"a": [1.0, 2.0, 99.0], "b": [10, 20, 30], "target": [0, 1, 0]})
+        df_extra_row = pd.DataFrame({"a": [1.0, 2.0, 3.0, 4.0], "b": [10, 20, 30, 40], "target": [0, 1, 0, 1]})
+        df_rename_col = pd.DataFrame({"c": [1.0, 2.0, 3.0], "b": [10, 20, 30], "target": [0, 1, 0]})
+
+        fp_base = compute_dataset_fingerprint(df_base)
+        assert compute_dataset_fingerprint(df_modified_val) != fp_base
+        assert compute_dataset_fingerprint(df_extra_row) != fp_base
+        assert compute_dataset_fingerprint(df_rename_col) != fp_base
+
+    def test_dataset_fingerprint_propagates_to_profile_state_and_corpus(self, tmp_path):
+        from stratml.execution.data.validator import build_dataset
+        from stratml.execution.data.profiler import build_profile
+
+        df = pd.DataFrame({"feat": range(20), "target": [0, 1] * 10})
+        ds = build_dataset(df, "fp_test", "target")
+        prof = build_profile(ds)
+
+        assert prof.dataset_fingerprint == ds.dataset_fingerprint
+        assert prof.dataset_fingerprint is not None
+
+        state = build_state_from_profile(prof, run_id="run_fp_check")
+        assert state.dataset.dataset_fingerprint == ds.dataset_fingerprint
+
+        csv_path = tmp_path / "decision_dataset.csv"
+        dataset_builder._DATASET_PATH = csv_path
+        dataset_builder._UNIFIED_PATH = csv_path
+
+        act = CandidateAction(action_type="switch_model", parameters={"model_name": "RandomForestClassifier"})
+        dataset_builder.record(state, act, predicted_gain=0.05, run_id="run_fp_check", dataset_id="fp_test")
+        dataset_builder.backfill_last_gain(0.04, status="completed")
+
+        recorded_df = pd.read_csv(csv_path)
+        assert "dataset_fingerprint" in recorded_df.columns
+        assert recorded_df["dataset_fingerprint"].iloc[0] == ds.dataset_fingerprint
+
+
+class TestRound2_P0_2_And_P0_5_MetaMemoryHistoryModeAndIsolation:
+    def test_independent_runs_do_not_influence_each_other_via_meta_memory(self, tmp_path, monkeypatch):
+        global_mem = tmp_path / "global_meta_memory.jsonl"
+        monkeypatch.setattr(_meta_memory, "_MEMORY_FILE", global_mem)
+
+        profile = DataProfile(
+            dataset_name="dataset_iso",
+            dataset_type="tabular",
+            rows=100,
+            columns=5,
+            target_column="target",
+            problem_type="classification",
+            numerical_columns=["f1", "f2"],
+            categorical_columns=[],
+            missing_value_ratio=0.0,
+            class_distribution={"0": 50, "1": 50},
+            feature_summary=[],
+            recommended_metrics=["accuracy"],
+            dataset_fingerprint="fingerprint_iso_1",
+        )
+
+        # Run A: independent run that finishes with best model GradientBoostingClassifier
+        engine_a = DecisionEngine(
+            history_mode="independent",
+            allowed_models=["RandomForestClassifier", "GradientBoostingClassifier"],
+            llm_mode=False,
+        )
+        engine_a.receive_profile(profile)
+        monkeypatch.setattr(_meta_memory, "_MEMORY_FILE", global_mem)
+        _meta_memory.record_run(
+            profile,
+            best_model="GradientBoostingClassifier",
+            best_score=0.95,
+            run_id=engine_a.run_id,
+            dataset_id="dataset_iso",
+            dataset_fingerprint="fingerprint_iso_1",
+        )
+
+        # Run B: independent run on same dataset
+        engine_b = DecisionEngine(
+            history_mode="independent",
+            allowed_models=["RandomForestClassifier", "GradientBoostingClassifier"],
+            llm_mode=False,
+        )
+        dec_b = engine_b.receive_profile(profile)
+
+        # In independent mode, previous runs MUST NOT influence allowed_models or decision
+        assert engine_b.allowed_models == ["RandomForestClassifier", "GradientBoostingClassifier"]
+        assert dec_b.parameters.get("model_name") == "RandomForestClassifier"
+
+    def test_continual_mode_reuses_relevant_experience_on_same_dataset(self, tmp_path, monkeypatch):
+        global_mem = tmp_path / "global_meta_memory.jsonl"
+        monkeypatch.setattr(_meta_memory, "_MEMORY_FILE", global_mem)
+
+        profile_same = DataProfile(
+            dataset_name="dataset_cont",
+            dataset_type="tabular",
+            rows=100,
+            columns=5,
+            target_column="target",
+            problem_type="classification",
+            numerical_columns=["f1", "f2"],
+            categorical_columns=[],
+            missing_value_ratio=0.0,
+            class_distribution={"0": 50, "1": 50},
+            feature_summary=[],
+            recommended_metrics=["accuracy"],
+            dataset_fingerprint="fingerprint_cont_1",
+        )
+
+        _meta_memory.record_run(
+            profile_same,
+            best_model="GradientBoostingClassifier",
+            best_score=0.92,
+            run_id="run_past_cont",
+            dataset_id="dataset_cont",
+            dataset_fingerprint="fingerprint_cont_1",
+        )
+
+        engine_cont = DecisionEngine(
+            history_mode="continual",
+            allowed_models=["RandomForestClassifier", "GradientBoostingClassifier"],
+            llm_mode=False,
+        )
+        dec_cont = engine_cont.receive_profile(profile_same)
+
+        assert engine_cont.allowed_models[0] == "GradientBoostingClassifier"
+        assert dec_cont.parameters.get("model_name") == "GradientBoostingClassifier"
+
+    def test_transfer_mode_reuses_cross_dataset_experience_only(self, tmp_path, monkeypatch):
+        global_mem = tmp_path / "global_meta_memory.jsonl"
+        monkeypatch.setattr(_meta_memory, "_MEMORY_FILE", global_mem)
+
+        profile_a = DataProfile(
+            dataset_name="dataset_A",
+            dataset_type="tabular",
+            rows=100,
+            columns=5,
+            target_column="target",
+            problem_type="classification",
+            numerical_columns=["f1", "f2"],
+            categorical_columns=[],
+            missing_value_ratio=0.0,
+            class_distribution={"0": 50, "1": 50},
+            feature_summary=[],
+            recommended_metrics=["accuracy"],
+            dataset_fingerprint="fingerprint_A",
+        )
+        profile_b = DataProfile(
+            dataset_name="dataset_B",
+            dataset_type="tabular",
+            rows=100,
+            columns=5,
+            target_column="target",
+            problem_type="classification",
+            numerical_columns=["f1", "f2"],
+            categorical_columns=[],
+            missing_value_ratio=0.0,
+            class_distribution={"0": 50, "1": 50},
+            feature_summary=[],
+            recommended_metrics=["accuracy"],
+            dataset_fingerprint="fingerprint_B",
+        )
+
+        _meta_memory.record_run(
+            profile_a,
+            best_model="GradientBoostingClassifier",
+            best_score=0.92,
+            run_id="run_past_A",
+            dataset_id="dataset_A",
+            dataset_fingerprint="fingerprint_A",
+        )
+
+        # Transfer run on SAME dataset: must NOT reuse dataset_A experience
+        engine_same = DecisionEngine(
+            history_mode="transfer",
+            allowed_models=["RandomForestClassifier", "GradientBoostingClassifier"],
+            llm_mode=False,
+        )
+        engine_same.receive_profile(profile_a)
+        assert engine_same.allowed_models == ["RandomForestClassifier", "GradientBoostingClassifier"]
+
+        # Transfer run on DIFFERENT dataset: MUST reuse cross-dataset experience
+        engine_diff = DecisionEngine(
+            history_mode="transfer",
+            allowed_models=["RandomForestClassifier", "GradientBoostingClassifier"],
+            llm_mode=False,
+        )
+        dec_diff = engine_diff.receive_profile(profile_b)
+        assert engine_diff.allowed_models[0] == "GradientBoostingClassifier"
+        assert dec_diff.parameters.get("model_name") == "GradientBoostingClassifier"
+
+
+class TestRound2_P0_3_AuthoritativeLLMMode:
+    def test_llm_mode_false_never_calls_llm_even_with_api_key(self, monkeypatch):
+        from stratml.decision.llm_control import is_llm_enabled
+        from stratml.decision.actions import action_generator
+        from stratml.decision.agents import coordinator_agent, evaluator_agent, performance_agent, stability_agent, efficiency_agent
+
+        monkeypatch.setenv("GROQ_API_KEY", "gsk_live_api_key_for_testing")
+
+        engine = DecisionEngine(llm_mode=False)
+        assert engine.llm_config["llm_mode_configured"] is False
+        assert engine.llm_config["llm_mode_enabled"] is False
+        assert is_llm_enabled() is False
+
+        # Verify artifacts/llm_config.json reflects this
+        cfg_file = engine._out_dir / "artifacts" / "llm_config.json"
+        assert cfg_file.exists()
+        saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+        assert saved["llm_mode_configured"] is False
+        assert saved["llm_mode_enabled"] is False
+
+        # Verify LLM helpers are never called
+        called = {"llm": False}
+        def fail_if_called(*args, **kwargs):
+            called["llm"] = True
+            raise RuntimeError("LLM was invoked despite llm_mode=False!")
+
+        monkeypatch.setattr(action_generator, "_llm_candidates", fail_if_called)
+        monkeypatch.setattr(coordinator_agent, "_llm_rank", fail_if_called)
+        monkeypatch.setattr(evaluator_agent, "_llm_audit", fail_if_called)
+        monkeypatch.setattr(performance_agent, "_llm_score", fail_if_called)
+        monkeypatch.setattr(stability_agent, "_llm_score", fail_if_called)
+        monkeypatch.setattr(efficiency_agent, "_llm_score", fail_if_called)
+
+        state = _make_state()
+        state.meta.iteration = 1  # non-bootstrap
+
+        # Action generator returns rule candidates
+        cands = action_generator.generate(state)
+        assert len(cands) > 0
+        assert not called["llm"]
+
+        # Coordinator rank returns rule rank
+        estimates = [
+            UncertaintyEstimate(
+                action_type=c.action_type,
+                parameters=c.parameters,
+                predicted_gain=0.05,
+                predicted_cost=0.5,
+                confidence=0.8,
+                variance=0.01,
+            )
+            for c in cands
+        ]
+        p_scores = performance_agent.score(state, estimates)
+        e_scores = efficiency_agent.score(state, estimates)
+        s_scores = stability_agent.score(state, estimates)
+        ranked = coordinator_agent.rank(state, estimates, p_scores, e_scores, s_scores)
+        assert len(ranked) > 0
+        assert not called["llm"]
+
+
+class TestRound2_P0_4_ExperimentSeedPropagationToRemainingComponents:
+    def test_profiler_uses_experiment_seed_for_sampling(self, monkeypatch):
+        from stratml.execution.data.validator import build_dataset
+        from stratml.execution.data.profiler import build_profile
+        import stratml.execution.data.profiler as profiler_mod
+
+        df = pd.DataFrame({"x": range(1000), "y": [0, 1] * 500})
+        ds = build_dataset(df, "test", "y")
+
+        captured_seeds = []
+        orig_describe = profiler_mod._describe_feature
+
+        def tracking_describe(series, random_seed=42):
+            captured_seeds.append(random_seed)
+            return orig_describe(series, random_seed=random_seed)
+
+        monkeypatch.setattr(profiler_mod, "_describe_feature", tracking_describe)
+
+        build_profile(ds, random_seed=777)
+        assert 777 in captured_seeds
+
+    def test_value_model_uses_experiment_seed_for_random_forest(self, monkeypatch):
+        from stratml.decision.learning import value_model
+        from sklearn.ensemble import RandomForestRegressor
+
+        state = _make_state()
+        candidates = [CandidateAction(action_type="switch_model", parameters={"model_name": "RandomForestClassifier"})]
+
+        captured_seed = []
+        orig_rf_init = RandomForestRegressor.__init__
+
+        def tracking_rf_init(self, *args, **kwargs):
+            captured_seed.append(kwargs.get("random_state"))
+            orig_rf_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(RandomForestRegressor, "__init__", tracking_rf_init)
+
+        # Mock X_train, y_train to trigger RF training
+        monkeypatch.setattr(value_model, "_load_training_data", lambda *a, **kw: (np.ones((60, 13)), np.ones(60)))
+
+        value_model.predict(state, candidates, seed=999)
+        assert 999 in captured_seed

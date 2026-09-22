@@ -168,6 +168,7 @@ def run_pipeline(args):
         allowed_models=allowed_models,
         run_id=run_id,
         seed=seed,
+        llm_mode=config.get("llm_mode", e.get("llm_mode")),
     )
 
     def _log(msg): print(msg)

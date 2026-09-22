@@ -35,6 +35,7 @@ from stratml.decision.learning import dataset_builder
 from stratml.decision.learning import meta_memory as _meta_memory
 from stratml.decision.state.meta_features import extract as _extract_meta
 from stratml.decision.learning import value_model as _value_model
+from stratml.decision.llm_control import set_llm_mode, is_llm_enabled
 import os
 
 
@@ -100,12 +101,21 @@ class DecisionEngine:
         else:
             _value_model._DATASET_PATH = Path("runs/decision_logs/decision_dataset.csv")
 
-        # Record resolved LLM configuration (P0-7)
-        llm_mode_enabled = bool(os.getenv("GROQ_API_KEY")) if llm_mode is None else llm_mode
+        # MetaMemory isolation
+        if self.history_mode == "independent":
+            _meta_memory._MEMORY_FILE = self._out_dir / "decision_logs" / "meta_memory.jsonl"
+        elif "outputs" in str(_meta_memory._MEMORY_FILE):
+            _meta_memory._MEMORY_FILE = Path("runs/decision_logs/meta_memory.jsonl")
+
+        # Record resolved LLM configuration (P0-7 & P0-3)
+        set_llm_mode(llm_mode)
+        self.llm_mode = llm_mode
+        llm_active = is_llm_enabled()
         self.llm_config = {
             "provider": "groq",
             "model": "llama-3.3-70b-versatile",
-            "llm_mode_enabled": llm_mode_enabled,
+            "llm_mode_configured": llm_mode,
+            "llm_mode_enabled": llm_active,
             "temperature": {
                 "action_generator": 0.2,
                 "specialist_agents": 0.0,
@@ -127,6 +137,7 @@ class DecisionEngine:
 
     def receive_profile(self, profile: DataProfile) -> ActionDecision:
         self._profile = profile
+        self._dataset_fingerprint = getattr(profile, "dataset_fingerprint", None)
         if not self._metric_explicit or self.primary_metric is None:
             if profile.problem_type == "regression":
                 self.primary_metric = "r2"
@@ -136,13 +147,20 @@ class DecisionEngine:
                 self.optimization_goal = "maximize"
 
         meta = _extract_meta(profile)
-        similar_models = _meta_memory.retrieve_similar_actions(meta)
+        similar_models = _meta_memory.retrieve_similar_actions(
+            meta,
+            history_mode=self.history_mode,
+            current_run_id=self.run_id,
+            current_dataset_id=profile.dataset_name,
+            current_dataset_fingerprint=self._dataset_fingerprint,
+        )
         allowed = self.allowed_models
         if similar_models and allowed:
             # Prioritise similar models by moving them to front
             reordered = [m for m in similar_models if m in allowed]
             rest = [m for m in allowed if m not in reordered]
             allowed = reordered + rest
+            self.allowed_models = allowed
         state = build_state_from_profile(
             profile,
             run_id=self.run_id,
@@ -212,7 +230,7 @@ class DecisionEngine:
     def _decide(self, state) -> ActionDecision:
         candidates: list[CandidateAction] = generate(state)
 
-        predictions = predict(state, candidates)
+        predictions = predict(state, candidates, seed=self.seed)
         calibrated  = calibrate(predictions)
         estimates   = estimate(calibrated, state)
 
@@ -237,6 +255,7 @@ class DecisionEngine:
             predicted_gain=predicted_gain,
             run_id=self.run_id,
             dataset_id=self._profile.dataset_name if self._profile else None,
+            dataset_fingerprint=self._dataset_fingerprint,
             seed=self.seed,
         )
         decision_logger.log(state, candidates, decision)
@@ -255,5 +274,12 @@ class DecisionEngine:
             if self._profile is not None:
                 meta = _extract_meta(self._profile)
                 best_model = self._best_model or (state.search.models_tried[-1] if state.search.models_tried else "unknown")
-                _meta_memory.record_run(meta, best_model, state.trajectory.best_score, self.run_id)
+                _meta_memory.record_run(
+                    meta,
+                    best_model,
+                    state.trajectory.best_score,
+                    self.run_id,
+                    dataset_id=self._profile.dataset_name,
+                    dataset_fingerprint=self._dataset_fingerprint,
+                )
         return decision

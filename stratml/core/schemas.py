@@ -222,6 +222,7 @@ class StateDataset(BaseModel):
     missing_ratio: float
     class_distribution: Optional[dict] = None
     imbalance_ratio: Optional[float] = None
+    dataset_fingerprint: Optional[str] = None
 
 
 class StateModel(BaseModel):

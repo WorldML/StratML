@@ -69,7 +69,7 @@ class ExecutionOrchestrator:
         self.log("  Loading dataset...")
         df, name = load_dataframe(dataset_path)
         dataset  = build_dataset(df, name, target_column)
-        profile  = build_profile(dataset)
+        profile  = build_profile(dataset, random_seed=self.split_config.random_seed)
         self.log(f"  Profiled: {profile.rows} rows x {profile.columns} cols | {profile.problem_type}")
 
         # ── Phase 3: Split once, reuse across all iterations ─────────────────

@@ -78,6 +78,7 @@ def build_state_from_profile(
             missing_ratio=profile.missing_value_ratio,
             class_distribution=class_dist,
             imbalance_ratio=imbalance_ratio,
+            dataset_fingerprint=getattr(profile, "dataset_fingerprint", None),
         ),
         model=StateModel(
             model_name="none", model_type="ml", hyperparameters={},
@@ -188,6 +189,7 @@ def build_state(
             missing_ratio=missing_ratio,
             class_distribution=class_dist,
             imbalance_ratio=imbalance_ratio,
+            dataset_fingerprint=getattr(profile, "dataset_fingerprint", None) if profile is not None else None,
         ),
         model=StateModel(
             model_name=result.model_name,

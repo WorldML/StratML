@@ -19,6 +19,7 @@ from typing import Optional
 from pydantic import BaseModel
 
 from stratml.core.schemas import CandidateAction, StateObject
+from stratml.decision.llm_control import is_llm_enabled
 from stratml.execution.pipelines.ml_pipeline import (
     PAPER_CLASSIFICATION_MODELS,
     PAPER_REGRESSION_MODELS,
@@ -82,7 +83,7 @@ def generate(state: StateObject) -> list[CandidateAction]:
         result = [CandidateAction(action_type="terminate", parameters={})]
     elif state.meta.iteration == 0:
         result = _bootstrap_candidates(state)
-    elif os.getenv("GROQ_API_KEY"):
+    elif is_llm_enabled():
         result = _llm_candidates(state)
         if result is None:
             result = _rule_candidates(state)

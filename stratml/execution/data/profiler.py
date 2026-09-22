@@ -13,7 +13,7 @@ from stratml.execution.schemas import Dataset, DataProfile, FeatureInfo
 _CLASSIFICATION_UNIQUE_THRESHOLD = 20
 
 
-def build_profile(dataset: Dataset) -> DataProfile:
+def build_profile(dataset: Dataset, random_seed: int = 42) -> DataProfile:
     df: pd.DataFrame = dataset.raw_dataframe
     target = dataset.target_column
 
@@ -24,7 +24,7 @@ def build_profile(dataset: Dataset) -> DataProfile:
     global_missing = df.isnull().values.mean()
     problem_type = _infer_problem_type(df[target])
     class_distribution = _class_distribution(df[target], problem_type)
-    feature_summary = [_describe_feature(df[col]) for col in feature_cols]
+    feature_summary = [_describe_feature(df[col], random_seed=random_seed) for col in feature_cols]
 
     imbalance_ratio = _imbalance_ratio(class_distribution) if problem_type == "classification" else None
     feature_variance_mean = _feature_variance_mean(df[numerical_cols]) if numerical_cols else None
@@ -46,6 +46,7 @@ def build_profile(dataset: Dataset) -> DataProfile:
         imbalance_ratio=imbalance_ratio,
         feature_variance_mean=feature_variance_mean,
         class_entropy=class_entropy,
+        dataset_fingerprint=getattr(dataset, "dataset_fingerprint", None),
     )
 
 
@@ -74,10 +75,10 @@ def _class_distribution(target_series: pd.Series, problem_type: str) -> dict[str
     return {str(k): int(v) for k, v in target_series.value_counts().items()}
 
 
-def _describe_feature(series: pd.Series) -> FeatureInfo:
+def _describe_feature(series: pd.Series, random_seed: int = 42) -> FeatureInfo:
     missing_pct = round(float(series.isnull().mean() * 100), 2)
     unique_vals = int(series.nunique(dropna=True))
-    distribution = _infer_distribution(series)
+    distribution = _infer_distribution(series, random_seed=random_seed)
     return FeatureInfo(
         name=series.name,
         dtype=str(series.dtype),
@@ -87,12 +88,12 @@ def _describe_feature(series: pd.Series) -> FeatureInfo:
     )
 
 
-def _infer_distribution(series: pd.Series) -> str:
+def _infer_distribution(series: pd.Series, random_seed: int = 42) -> str:
     clean = series.dropna()
     if not pd.api.types.is_numeric_dtype(clean) or len(clean) < 8:
         return "unknown"
     skewness = float(clean.skew())
-    sample = clean.sample(min(500, len(clean)), random_state=0)
+    sample = clean.sample(min(500, len(clean)), random_state=random_seed)
     _, p_value = scipy_stats.shapiro(sample)
     if p_value > 0.05 and abs(skewness) < 0.5:
         return "normal"

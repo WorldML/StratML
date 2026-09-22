@@ -112,6 +112,7 @@ def run_pipeline(args) -> None:
         run_id=run_id,
         dl_hyperparams=dl_hyperparams,
         seed=seed,
+        llm_mode=config.get("llm_mode", e.get("llm_mode")),
     )
 
     ExecutionOrchestrator(

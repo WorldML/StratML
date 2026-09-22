@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from stratml.core.schemas import StateObject
 from stratml.decision.learning.uncertainty import UncertaintyEstimate
+from stratml.decision.llm_control import is_llm_enabled
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +103,7 @@ def _llm_score(state: StateObject, estimates: list[UncertaintyEstimate]) -> Opti
 
 def score(state: StateObject, estimates: list[UncertaintyEstimate]) -> dict[str, float]:
     """Return stability_score per action_type. Higher = more stable choice."""
-    if os.getenv("GROQ_API_KEY"):
+    if is_llm_enabled():
         result = _llm_score(state, estimates)
         if result is not None:
             return result

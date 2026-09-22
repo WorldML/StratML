@@ -20,6 +20,8 @@ from typing import Any
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
+from stratml.decision.llm_control import is_llm_enabled
+
 try:
     from langchain_core.tools import tool
 except ImportError:
@@ -234,7 +236,7 @@ def compute_signals(state: StateObject) -> StateSignals:
     Use a ReAct agent to reason over state metrics and flag signals.
     Falls back to direct rule evaluation if the agent is unavailable.
     """
-    if not os.environ.get("GROQ_API_KEY"):
+    if not is_llm_enabled():
         return _rule_based(state)
 
     g = state.generalization

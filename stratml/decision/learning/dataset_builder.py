@@ -25,6 +25,7 @@ _UNIFIED_PATH = Path("runs/decision_logs/decision_dataset.csv")
 
 _COLUMNS = [
     "dataset_id",
+    "dataset_fingerprint",
     "run_id",
     "seed",
     "experiment_id",
@@ -72,6 +73,7 @@ def record(
     predicted_gain: float = 0.0,
     run_id: str | None = None,
     dataset_id: str | None = None,
+    dataset_fingerprint: str | None = None,
     seed: int | None = None,
 ) -> None:
     """Append a row for the selected action. observed_gain left blank until backfilled."""
@@ -82,10 +84,16 @@ def record(
         or getattr(state.dataset, "dataset_name", None)
         or "unknown_dataset"
     )
+    eff_dataset_fingerprint = (
+        dataset_fingerprint
+        or getattr(state.dataset, "dataset_fingerprint", None)
+        or "unknown_fingerprint"
+    )
     eff_seed = seed if seed is not None else getattr(state.meta, "seed", 42)
 
     row = {
         "dataset_id": eff_dataset_id,
+        "dataset_fingerprint": eff_dataset_fingerprint,
         "run_id": eff_run_id,
         "seed": eff_seed,
         "experiment_id": state.meta.experiment_id,

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from stratml.core.schemas import ActionDecision, ExperimentResult, StateObject
+from stratml.decision.llm_control import is_llm_enabled
 
 log = logging.getLogger(__name__)
 
@@ -197,7 +198,7 @@ def _llm_audit(decision: ActionDecision, result: ExperimentResult, state: StateO
 def audit(decision: ActionDecision, result: ExperimentResult, state: StateObject) -> EvaluationRecord:
     """Audit the previous decision against the new result. Appends to evaluation_log.jsonl."""
     rec = None
-    if os.getenv("GROQ_API_KEY"):
+    if is_llm_enabled():
         rec = _llm_audit(decision, result, state)
     if rec is None:
         rec = _rule_audit(decision, result, state)

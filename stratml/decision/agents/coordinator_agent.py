@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from stratml.core.schemas import AgentScore, StateObject
 from stratml.decision.learning.uncertainty import UncertaintyEstimate
+from stratml.decision.llm_control import is_llm_enabled
 
 log = logging.getLogger(__name__)
 
@@ -221,7 +222,7 @@ def rank(
     log_paths: list[str | Path] | None = None,
 ) -> list[RankedAction]:
     """Return candidates sorted by final_score descending."""
-    if os.getenv("GROQ_API_KEY"):
+    if is_llm_enabled():
         result = _llm_rank(state, estimates, perf_scores, eff_scores, stab_scores)
         if result is not None:
             return result
