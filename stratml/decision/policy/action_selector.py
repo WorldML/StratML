@@ -86,25 +86,36 @@ def select(
 ) -> ActionDecision:
     """Pick an action using epsilon-greedy exploration, then return an ActionDecision."""
     local_rng = rng if rng is not None else (random.Random(seed) if seed is not None else random)
+
     if state.resources.budget_exhausted:
         best = next((r for r in ranked if r.action_type == "terminate"), ranked[0])
         effective_source = "rule"
     else:
         epsilon = _EPSILON_LOW_DATA if _row_count() < _MIN_ROWS else _EPSILON_HIGH_DATA
         non_terminate = [r for r in ranked if r.action_type != "terminate"]
-        if non_terminate:
-            if decision_source == "llm":
-                best = non_terminate[0]
-                effective_source = "llm"
-            elif local_rng.random() < epsilon:
-                best = local_rng.choice(non_terminate)
-                effective_source = "fallback"
-            else:
-                best = non_terminate[0]
-                effective_source = decision_source or ("learned" if getattr(best, "rationale", "") else "rule")
+        candidates_pool = non_terminate if non_terminate else ranked
+
+        top_source = getattr(candidates_pool[0], "source", None)
+        if top_source == "llm" or decision_source == "llm":
+            best = candidates_pool[0]
+            effective_source = "llm"
+        elif local_rng.random() < epsilon:
+            best = local_rng.choice(candidates_pool)
+            effective_source = decision_source or getattr(best, "source", None) or "rule"
         else:
-            best = ranked[0]
-            effective_source = decision_source or ("learned" if getattr(best, "rationale", "") else "rule")
+            best = candidates_pool[0]
+            candidate_source = getattr(best, "source", None)
+            if decision_source is not None:
+                effective_source = decision_source
+            elif candidate_source is not None:
+                effective_source = candidate_source
+            elif getattr(best, "rationale", ""):
+                effective_source = "learned"
+            else:
+                effective_source = "rule"
+
+        if state.meta.iteration == 0:
+            effective_source = "bootstrap"
 
     trigger = _infer_trigger(state)
     evidence = _build_evidence(state)

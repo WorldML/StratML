@@ -61,6 +61,7 @@ from stratml.decision.engine import DecisionEngine
 from stratml.decision.agents import coordinator_agent, evaluator_agent
 from stratml.decision.logging import decision_logger
 from stratml.decision.learning import dataset_builder, meta_memory, value_model
+from stratml.decision.learning.uncertainty import UncertaintyEstimate
 from stratml.decision.policy.action_selector import select
 from stratml.orchestration.orchestrator import ExecutionOrchestrator
 
@@ -138,6 +139,47 @@ def _make_dummy_result(
     return result
 
 
+def _make_dummy_state(
+    iteration: int = 1,
+    primary: float = 0.72,
+    underfitting: str = "none",
+    well_fitted: str = "strong",
+    remaining_budget: float = 15.0,
+) -> StateObject:
+    return StateObject(
+        meta=StateMeta(experiment_id="test_exp", iteration=iteration, timestamp="2026-01-01T00:00:00+00:00"),
+        objective=StateObjective(primary_metric="accuracy", optimization_goal="maximize"),
+        metrics=StateMetrics(primary=primary, secondary=SecondaryMetrics(), train_val_gap=0.02),
+        trajectory=StateTrajectory(
+            history_length=3, improvement_rate=0.01, slope=0.005,
+            volatility=0.02, best_score=primary, mean_score=primary - 0.02,
+            steps_since_improvement=1, trend="improving",
+        ),
+        dataset=StateDataset(num_samples=500, num_features=10, feature_to_sample_ratio=0.02, missing_ratio=0.0),
+        model=StateModel(
+            model_name="RandomForest", model_type="ml", hyperparameters={"n_estimators": 100},
+            runtime=10.0, convergence_epoch=0,
+        ),
+        generalization=StateGeneralization(train_loss=0.2, validation_loss=0.22, gap=0.02),
+        resources=StateResources(runtime=10.0, gpu_used=False, cpu_time=10.0, remaining_budget=remaining_budget, budget_exhausted=remaining_budget <= 0),
+        search=StateSearch(models_tried=["RandomForest"], unique_models_count=1, repeated_configs=0),
+        signals=StateSignals(
+            underfitting=underfitting, overfitting="none", well_fitted=well_fitted,
+            converged="none", stagnating="none", diverging="none",
+            plateau_detected="none", diminishing_returns="none",
+            unstable_training="none", high_variance="none",
+        ),
+        uncertainty=StateUncertainty(),
+        action_context=StateActionContext(),
+        constraints=StateConstraints(
+            allowed_models=["LogisticRegression", "RandomForest", "GradientBoosting", "SVC"],
+            max_iterations=20,
+        ),
+    )
+
+_make_state = _make_dummy_state
+
+
 # ===========================================================================
 # P0-21: Independently disable MetaMemory and Value Model
 # ===========================================================================
@@ -201,6 +243,9 @@ class TestP0_21_IndependentAblationControls:
 # ===========================================================================
 # P0-22: Deterministic, bounded, and attributable coordinator weight learning
 # ===========================================================================
+# ===========================================================================
+# P0-22: Deterministic, bounded, attributable, and persisted coordinator weight learning
+# ===========================================================================
 class TestP0_22_AttributableCoordinatorWeightLearning:
     def test_identical_inputs_produce_identical_weights_and_history(self, tmp_path):
         eval_log = tmp_path / "eval_log.jsonl"
@@ -250,26 +295,132 @@ class TestP0_22_AttributableCoordinatorWeightLearning:
         # Normalization
         assert round(w_p + w_e + w_s, 2) == 1.0
 
-    def test_each_update_is_attributable(self, tmp_path):
-        eval_log = tmp_path / "attr_eval_log.jsonl"
+    def test_one_evaluation_produces_one_persisted_attributable_update(self, tmp_path):
+        eval_log = tmp_path / "eval_log.jsonl"
+        update_log = tmp_path / "coordinator_weight_updates.jsonl"
         records = [
-            {"counterfactual_impact": 0.02, "decision_validity": 0.8, "quality_risk": 0.2, "iteration": 10, "experiment_id": "exp_attr"}
-            for _ in range(6)
+            {"counterfactual_impact": 0.02, "decision_validity": 0.8, "quality_risk": 0.2, "iteration": i, "experiment_id": f"eval_{i}", "run_id": "run_test"}
+            for i in range(6)
         ]
         with open(eval_log, "w", encoding="utf-8") as f:
             for r in records:
                 f.write(json.dumps(r) + "\n")
 
         coordinator_agent.reset_weight_update_history()
-        coordinator_agent._load_agent_weights(log_paths=[eval_log])
-        history = coordinator_agent.get_weight_update_history()
+        coordinator_agent._load_agent_weights(log_paths=[eval_log], update_log_path=update_log, run_id="run_test")
 
-        for update in history:
-            assert "update_index" in update
-            assert "previous_weights" in update
-            assert "evidence" in update
-            assert "new_weights" in update
-            assert update["evidence"]["counterfactual_impact"] == 0.02
+        persisted = coordinator_agent.get_persisted_weight_updates(update_log)
+        assert len(persisted) == 6
+
+        # Idempotence: calling again does not create duplicate entries
+        coordinator_agent._load_agent_weights(log_paths=[eval_log], update_log_path=update_log, run_id="run_test")
+        persisted_again = coordinator_agent.get_persisted_weight_updates(update_log)
+        assert len(persisted_again) == 6
+
+    def test_previous_and_new_weights_are_correct(self, tmp_path):
+        eval_log = tmp_path / "eval_log.jsonl"
+        update_log = tmp_path / "coordinator_weight_updates.jsonl"
+        records = [
+            {"counterfactual_impact": 0.05, "decision_validity": 0.9, "quality_risk": 0.1, "iteration": 1, "experiment_id": "eval_1", "run_id": "run_test"},
+            {"counterfactual_impact": -0.05, "decision_validity": 0.2, "quality_risk": 0.8, "iteration": 2, "experiment_id": "eval_2", "run_id": "run_test"},
+            {"counterfactual_impact": 0.01, "decision_validity": 0.7, "quality_risk": 0.3, "iteration": 3, "experiment_id": "eval_3", "run_id": "run_test"},
+            {"counterfactual_impact": 0.02, "decision_validity": 0.6, "quality_risk": 0.4, "iteration": 4, "experiment_id": "eval_4", "run_id": "run_test"},
+            {"counterfactual_impact": 0.04, "decision_validity": 0.8, "quality_risk": 0.2, "iteration": 5, "experiment_id": "eval_5", "run_id": "run_test"},
+        ]
+        with open(eval_log, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+        coordinator_agent.reset_weight_update_history()
+        coordinator_agent._load_agent_weights(log_paths=[eval_log], update_log_path=update_log, run_id="run_test")
+        persisted = coordinator_agent.get_persisted_weight_updates(update_log)
+
+        for entry in persisted:
+            assert "previous_weights" in entry
+            assert "new_weights" in entry
+            for k in ("performance", "efficiency", "stability"):
+                assert k in entry["previous_weights"]
+                assert k in entry["new_weights"]
+                assert entry["new_weights"][k] >= 1e-4
+            # Normalized sums
+            prev_sum = sum(entry["previous_weights"][k] for k in ("performance", "efficiency", "stability"))
+            new_sum = sum(entry["new_weights"][k] for k in ("performance", "efficiency", "stability"))
+            assert abs(prev_sum - 1.0) < 1e-3
+            assert abs(new_sum - 1.0) < 1e-3
+
+    def test_evaluation_iteration_and_run_ids_are_correct(self, tmp_path):
+        eval_log = tmp_path / "eval_log.jsonl"
+        update_log = tmp_path / "coordinator_weight_updates.jsonl"
+        records = [
+            {"counterfactual_impact": 0.02, "decision_validity": 0.8, "quality_risk": 0.2, "iteration": i, "experiment_id": f"custom_eval_{i}", "run_id": f"custom_run_{i}"}
+            for i in range(6)
+        ]
+        with open(eval_log, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+        coordinator_agent.reset_weight_update_history()
+        coordinator_agent._load_agent_weights(log_paths=[eval_log], update_log_path=update_log)
+        persisted = coordinator_agent.get_persisted_weight_updates(update_log)
+
+        for i, entry in enumerate(persisted):
+            assert entry["evaluation_id"] == f"custom_eval_{i}"
+            assert entry["iteration"] == i
+            assert entry["run_id"] == f"custom_run_{i}"
+
+    def test_persisted_history_survives_process_completion(self, tmp_path):
+        eval_log = tmp_path / "eval_log.jsonl"
+        update_log = tmp_path / "coordinator_weight_updates.jsonl"
+        records = [
+            {"counterfactual_impact": 0.02, "decision_validity": 0.8, "quality_risk": 0.2, "iteration": i, "experiment_id": f"eval_{i}", "run_id": "run_survival"}
+            for i in range(6)
+        ]
+        with open(eval_log, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+        coordinator_agent.reset_weight_update_history()
+        coordinator_agent._load_agent_weights(log_paths=[eval_log], update_log_path=update_log, run_id="run_survival")
+
+        # Simulate process exit: reset in-memory variables
+        coordinator_agent.reset_weight_update_history()
+        assert len(coordinator_agent._WEIGHT_UPDATE_HISTORY) == 0
+
+        # Artifact on disk survives
+        reloaded = coordinator_agent.get_weight_update_history(log_path=update_log)
+        assert len(reloaded) == 6
+        assert reloaded[0]["evaluation_id"] == "eval_0"
+
+    def test_replaying_ordered_updates_reconstructs_observed_weight_trajectory(self, tmp_path):
+        eval_log = tmp_path / "eval_log.jsonl"
+        update_log = tmp_path / "coordinator_weight_updates.jsonl"
+        records = [
+            {"counterfactual_impact": 0.05, "decision_validity": 0.9, "quality_risk": 0.1, "iteration": 1, "experiment_id": "eval_1", "run_id": "run_traj"},
+            {"counterfactual_impact": -0.05, "decision_validity": 0.2, "quality_risk": 0.8, "iteration": 2, "experiment_id": "eval_2", "run_id": "run_traj"},
+            {"counterfactual_impact": 0.02, "decision_validity": 0.85, "quality_risk": 0.15, "iteration": 3, "experiment_id": "eval_3", "run_id": "run_traj"},
+            {"counterfactual_impact": 0.00, "decision_validity": 0.6, "quality_risk": 0.3, "iteration": 4, "experiment_id": "eval_4", "run_id": "run_traj"},
+            {"counterfactual_impact": 0.03, "decision_validity": 0.75, "quality_risk": 0.25, "iteration": 5, "experiment_id": "eval_5", "run_id": "run_traj"},
+        ]
+        with open(eval_log, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+        coordinator_agent.reset_weight_update_history()
+        final_weights = coordinator_agent._load_agent_weights(log_paths=[eval_log], update_log_path=update_log, run_id="run_traj")
+        persisted = coordinator_agent.get_persisted_weight_updates(update_log)
+
+        # Sequential trajectory continuity
+        for i in range(1, len(persisted)):
+            prev_entry = persisted[i - 1]
+            curr_entry = persisted[i]
+            for k in ("performance", "efficiency", "stability"):
+                assert abs(curr_entry["previous_weights"][k] - prev_entry["new_weights"][k]) < 1e-4
+
+        # Final weights match active coordinator weights
+        last = persisted[-1]
+        assert abs(last["new_weights"]["performance"] - final_weights[0]) < 1e-3
+        assert abs(last["new_weights"]["efficiency"] - final_weights[1]) < 1e-3
+        assert abs(last["new_weights"]["stability"] - final_weights[2]) < 1e-3
 
 
 # ===========================================================================
@@ -298,19 +449,24 @@ class TestP0_23_CoordinatorWeightsPersistence:
 
 
 # ===========================================================================
-# P0-24: Correct decision-source classification
+# P0-24: Mechanism-based decision-source attribution
 # ===========================================================================
 class TestP0_24_DecisionSourceClassification:
-    def test_rule_source_when_no_llm_and_no_learned_value_model(self, tmp_path, monkeypatch):
+    def test_rule_selected_decision_source_rule(self, tmp_path, monkeypatch):
+        """Rule path produces source='rule'."""
         run_id = f"test_source_rule_{uuid.uuid4().hex[:6]}"
         monkeypatch.chdir(tmp_path)
 
-        engine = DecisionEngine(run_id=run_id, llm_mode=False)
+        engine = DecisionEngine(run_id=run_id, llm_mode=False, enable_value_model=False)
         profile = _make_dummy_profile()
-        decision = engine.receive_profile(profile)
-        assert decision.reason.source in ("rule", "bootstrap")
+        engine.receive_profile(profile)
 
-    def test_llm_source_when_llm_generates_rationale(self, tmp_path, monkeypatch):
+        res = _make_dummy_result(experiment_id=run_id, iteration=1)
+        decision = engine.receive_result(res)
+        assert decision.reason.source == "rule"
+
+    def test_llm_selected_decision_source_llm(self, tmp_path, monkeypatch):
+        """LLM-generated ranking propagates source='llm'."""
         run_id = f"test_source_llm_{uuid.uuid4().hex[:6]}"
         monkeypatch.chdir(tmp_path)
 
@@ -318,26 +474,68 @@ class TestP0_24_DecisionSourceClassification:
         profile = _make_dummy_profile()
         engine.receive_profile(profile)
 
-        with patch("stratml.decision.engine.is_llm_enabled", return_value=True), \
-             patch("stratml.decision.agents.coordinator_agent.rank") as mock_rank:
+        with patch("stratml.decision.agents.coordinator_agent.is_llm_enabled", return_value=True), \
+             patch("stratml.decision.agents.coordinator_agent._llm_rank") as mock_llm:
             from stratml.decision.agents.coordinator_agent import RankedAction
-            mock_rank.return_value = [
+            mock_llm.return_value = [
                 RankedAction(
                     action_type="switch_model",
                     parameters={"model_name": "GradientBoostingClassifier"},
-                    predicted_gain=0.05,
+                    predicted_gain=0.08,
                     predicted_cost=0.5,
-                    confidence=0.8,
-                    agent_scores=AgentScore(performance=0.8, efficiency=0.5, stability=0.7),
-                    final_score=0.75,
-                    rationale="LLM selected GradientBoostingClassifier due to low dataset noise.",
+                    confidence=0.85,
+                    agent_scores=AgentScore(performance=0.85, efficiency=0.6, stability=0.7),
+                    final_score=0.82,
+                    rationale="LLM selected GradientBoostingClassifier based on feature interactions.",
+                    source="llm",
                 )
             ]
             res = _make_dummy_result(experiment_id=run_id, iteration=1)
             decision = engine.receive_result(res)
             assert decision.reason.source == "llm"
 
-    def test_fallback_source_when_llm_fails(self, tmp_path, monkeypatch):
+    def test_value_model_selected_decision_source_value_model(self, tmp_path):
+        """Pure value-model-driven selection propagates source='value_model'."""
+        from stratml.decision.agents.coordinator_agent import RankedAction
+        from stratml.decision.policy.action_selector import select
+        state = _make_state(iteration=2)
+        ranked = [
+            RankedAction(
+                action_type="switch_model",
+                parameters={"model_name": "SVC"},
+                predicted_gain=0.12,
+                predicted_cost=0.4,
+                confidence=0.9,
+                agent_scores=AgentScore(performance=0.9, efficiency=0.7, stability=0.8),
+                final_score=0.88,
+                source="value_model",
+            )
+        ]
+        decision = select(state, ranked)
+        assert decision.reason.source == "value_model"
+
+    def test_hybrid_decision_source_hybrid(self, tmp_path, monkeypatch):
+        """Combination of learned value model predictions + coordinator weights produces source='hybrid'."""
+        from stratml.decision.agents import coordinator_agent
+        state = _make_state(iteration=2)
+        estimates = [
+            UncertaintyEstimate(action_type="switch_model", parameters={}, predicted_gain=0.08, predicted_cost=0.5, confidence=0.8, variance=0.01)
+        ]
+        ranked = coordinator_agent.rank(
+            state, estimates,
+            perf_scores={"switch_model": 0.8},
+            eff_scores={"switch_model": 0.6},
+            stab_scores={"switch_model": 0.7},
+            has_learned_model=True,
+        )
+        assert ranked[0].source == "hybrid"
+
+        from stratml.decision.policy.action_selector import select
+        decision = select(state, ranked)
+        assert decision.reason.source == "hybrid"
+
+    def test_unavailable_mechanism_with_fallback_source_fallback(self, tmp_path, monkeypatch):
+        """When LLM is enabled but fails, explicit fallback source='fallback' is propagated."""
         run_id = f"test_source_fallback_{uuid.uuid4().hex[:6]}"
         monkeypatch.chdir(tmp_path)
 
@@ -345,25 +543,44 @@ class TestP0_24_DecisionSourceClassification:
         profile = _make_dummy_profile()
         engine.receive_profile(profile)
 
-        with patch("stratml.decision.engine.is_llm_enabled", return_value=True), \
-             patch("stratml.decision.agents.coordinator_agent.rank") as mock_rank:
-            from stratml.decision.agents.coordinator_agent import RankedAction
-            # No rationale present means LLM failed and rule fallback was used
-            mock_rank.return_value = [
-                RankedAction(
-                    action_type="switch_model",
-                    parameters={"model_name": "GradientBoostingClassifier"},
-                    predicted_gain=0.05,
-                    predicted_cost=0.5,
-                    confidence=0.8,
-                    agent_scores=AgentScore(performance=0.8, efficiency=0.5, stability=0.7),
-                    final_score=0.75,
-                    rationale="",
-                )
-            ]
+        with patch("stratml.decision.agents.coordinator_agent.is_llm_enabled", return_value=True), \
+             patch("stratml.decision.agents.coordinator_agent._llm_rank", return_value=None):
             res = _make_dummy_result(experiment_id=run_id, iteration=1)
             decision = engine.receive_result(res)
             assert decision.reason.source == "fallback"
+
+    def test_bootstrap_decision_source_bootstrap(self, tmp_path, monkeypatch):
+        """Initial decision at iteration 0 produces source='bootstrap'."""
+        run_id = f"test_source_bootstrap_{uuid.uuid4().hex[:6]}"
+        monkeypatch.chdir(tmp_path)
+
+        engine = DecisionEngine(run_id=run_id)
+        profile = _make_dummy_profile()
+        decision = engine.receive_profile(profile)
+        assert decision.reason.source == "bootstrap"
+
+    def test_llm_enabled_with_rationale_does_not_imply_llm_unless_llm_determined_decision(self):
+        """LLM enabled + non-empty rationale does NOT yield 'llm' if fallback or rule determined the action."""
+        from stratml.decision.agents.coordinator_agent import RankedAction
+        from stratml.decision.policy.action_selector import select
+        state = _make_state(iteration=2)
+        # Action has rationale attached, but its mechanism source is 'fallback'
+        ranked = [
+            RankedAction(
+                action_type="switch_model",
+                parameters={"model_name": "GradientBoostingClassifier"},
+                predicted_gain=0.05,
+                predicted_cost=0.5,
+                confidence=0.8,
+                agent_scores=AgentScore(performance=0.8, efficiency=0.5, stability=0.7),
+                final_score=0.75,
+                rationale="Candidate rationale string from previous state inspection",
+                source="fallback",
+            )
+        ]
+        decision = select(state, ranked)
+        assert decision.reason.source == "fallback"
+        assert decision.reason.source != "llm"
 
 
 # ===========================================================================

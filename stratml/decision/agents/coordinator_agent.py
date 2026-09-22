@@ -13,9 +13,11 @@ The rationale string is stored in DecisionReason.evidence["rationale"] downstrea
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel
@@ -45,8 +47,24 @@ def get_current_weights() -> dict[str, float]:
     return dict(_CURRENT_WEIGHTS)
 
 
-def get_weight_update_history() -> list[dict]:
+def get_persisted_weight_updates(path: str | Path) -> list[dict]:
+    """Load persisted coordinator weight updates from a JSONL file."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    records = []
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
+
+
+def get_weight_update_history(log_path: str | Path | None = None) -> list[dict]:
     """Return the attributable audit trail of coordinator weight updates."""
+    if log_path is not None:
+        return get_persisted_weight_updates(log_path)
     return [dict(u) for u in _WEIGHT_UPDATE_HISTORY]
 
 
@@ -70,8 +88,27 @@ def _set_current_weights(w_p: float, w_e: float, w_s: float) -> None:
     }
 
 
-def _load_agent_weights(log_paths: list[str | Path] | None = None) -> tuple[float, float, float]:
-    """Compute per-agent EMA weights deterministically with full attributable audit trail."""
+def _get_update_log_path(
+    log_paths: list[str | Path] | None = None,
+    update_log_path: str | Path | None = None,
+    run_id: str | None = None,
+) -> Path | None:
+    if update_log_path is not None:
+        return Path(update_log_path)
+    if log_paths:
+        first = Path(log_paths[0])
+        return first.parent / "coordinator_weight_updates.jsonl"
+    if run_id:
+        return Path("outputs") / run_id / "decision_logs" / "coordinator_weight_updates.jsonl"
+    return None
+
+
+def _load_agent_weights(
+    log_paths: list[str | Path] | None = None,
+    update_log_path: str | Path | None = None,
+    run_id: str | None = None,
+) -> tuple[float, float, float]:
+    """Compute per-agent EMA weights deterministically with full attributable audit trail and artifact persistence."""
     import glob
     from pathlib import Path
     if log_paths is not None:
@@ -106,9 +143,18 @@ def _load_agent_weights(log_paths: list[str | Path] | None = None) -> tuple[floa
         w_p = w_e = w_s = 0.5
         _WEIGHT_UPDATE_HISTORY.clear()
 
+        persist_path = _get_update_log_path(log_paths=logs, update_log_path=update_log_path, run_id=run_id)
+
         for idx, r in enumerate(records):
-            eval_id = r.get("experiment_id") or f"eval_{idx}"
+            eval_id = r.get("evaluation_id") or r.get("experiment_id") or f"eval_{idx}"
             iteration = r.get("iteration")
+            rec_run_id = r.get("run_id") or run_id
+            if not rec_run_id and "_source_log" in r:
+                src_parts = Path(r["_source_log"]).parts
+                if len(src_parts) >= 3 and src_parts[-3] != "outputs":
+                    rec_run_id = src_parts[-3]
+            if not rec_run_id:
+                rec_run_id = str(eval_id)
 
             prev_total = w_p + w_e + w_s
             prev_norm = {
@@ -146,19 +192,76 @@ def _load_agent_weights(log_paths: list[str | Path] | None = None) -> tuple[floa
                 "stability_weight": round(w_s / new_total, 4),
             }
 
-            _WEIGHT_UPDATE_HISTORY.append({
+            entry = {
                 "update_index": idx,
-                "evaluation_id": eval_id,
+                "evaluation_id": str(eval_id),
+                "run_id": str(rec_run_id),
                 "iteration": iteration,
-                "previous_weights": prev_norm,
+                "previous_weights": {
+                    "performance": prev_norm["performance_weight"],
+                    "efficiency": prev_norm["efficiency_weight"],
+                    "stability": prev_norm["stability_weight"],
+                    "performance_weight": prev_norm["performance_weight"],
+                    "efficiency_weight": prev_norm["efficiency_weight"],
+                    "stability_weight": prev_norm["stability_weight"],
+                },
                 "evidence": evidence,
                 "unnormalized_weights": {
                     "performance": round(w_p, 6),
                     "efficiency": round(w_e, 6),
                     "stability": round(w_s, 6),
                 },
-                "new_weights": new_norm,
-            })
+                "new_weights": {
+                    "performance": new_norm["performance_weight"],
+                    "efficiency": new_norm["efficiency_weight"],
+                    "stability": new_norm["stability_weight"],
+                    "performance_weight": new_norm["performance_weight"],
+                    "efficiency_weight": new_norm["efficiency_weight"],
+                    "stability_weight": new_norm["stability_weight"],
+                },
+            }
+            _WEIGHT_UPDATE_HISTORY.append(entry)
+
+        # Persist attributable updates to append-only JSONL artifact
+        if persist_path is not None:
+            try:
+                persist_path.parent.mkdir(parents=True, exist_ok=True)
+                existing_keys = set()
+                if persist_path.exists():
+                    with open(persist_path, "r", encoding="utf-8") as f_in:
+                        for line in f_in:
+                            line = line.strip()
+                            if line:
+                                item = json.loads(line)
+                                existing_keys.add((
+                                    str(item.get("evaluation_id")),
+                                    item.get("iteration"),
+                                    str(item.get("run_id")),
+                                ))
+                with open(persist_path, "a", encoding="utf-8") as f_out:
+                    for entry in _WEIGHT_UPDATE_HISTORY:
+                        key = (str(entry.get("evaluation_id")), entry.get("iteration"), str(entry.get("run_id")))
+                        if key not in existing_keys:
+                            record_to_write = {
+                                "evaluation_id": entry["evaluation_id"],
+                                "run_id": entry["run_id"],
+                                "iteration": entry["iteration"],
+                                "previous_weights": {
+                                    "performance": entry["previous_weights"]["performance"],
+                                    "efficiency": entry["previous_weights"]["efficiency"],
+                                    "stability": entry["previous_weights"]["stability"],
+                                },
+                                "evidence": entry["evidence"],
+                                "new_weights": {
+                                    "performance": entry["new_weights"]["performance"],
+                                    "efficiency": entry["new_weights"]["efficiency"],
+                                    "stability": entry["new_weights"]["stability"],
+                                },
+                            }
+                            f_out.write(json.dumps(record_to_write) + "\n")
+                            existing_keys.add(key)
+            except Exception as e:
+                log.warning("Failed to persist coordinator weight updates to %s: %s", persist_path, e)
 
         total = w_p + w_e + w_s
         weights = (round(w_p / total, 4), round(w_e / total, 4), round(w_s / total, 4))
@@ -181,6 +284,7 @@ class RankedAction:
     agent_scores: AgentScore
     final_score: float
     rationale: str = field(default="")
+    source: Optional[str] = field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -194,9 +298,12 @@ def _rule_rank(
     eff_scores: dict[str, float],
     stab_scores: dict[str, float],
     log_paths: list[str | Path] | None = None,
+    source: str = "rule",
+    update_log_path: str | Path | None = None,
+    run_id: str | None = None,
 ) -> list[RankedAction]:
-    if log_paths is not None:
-        w_p, w_e, w_s = _load_agent_weights(log_paths=log_paths)
+    if log_paths is not None or update_log_path is not None or run_id is not None:
+        w_p, w_e, w_s = _load_agent_weights(log_paths=log_paths, update_log_path=update_log_path, run_id=run_id)
     else:
         w_p, w_e, w_s = _load_agent_weights()
     ranked: list[RankedAction] = []
@@ -213,6 +320,7 @@ def _rule_rank(
             confidence=e.confidence,
             agent_scores=AgentScore(performance=p, efficiency=ef, stability=st),
             final_score=final,
+            source=source,
         ))
     ranked.sort(key=lambda r: r.final_score, reverse=True)
     return ranked
@@ -301,6 +409,7 @@ def _llm_rank(
                 agent_scores=AgentScore(performance=p, efficiency=ef, stability=st),
                 final_score=final,
                 rationale=rationale,
+                source="llm",
             ))
 
         ranked.sort(key=lambda r: r.final_score, reverse=True)
@@ -321,10 +430,41 @@ def rank(
     eff_scores: dict[str, float],
     stab_scores: dict[str, float],
     log_paths: list[str | Path] | None = None,
+    source: Optional[str] = None,
+    has_learned_model: bool = False,
+    update_log_path: str | Path | None = None,
+    run_id: str | None = None,
 ) -> list[RankedAction]:
     """Return candidates sorted by final_score descending."""
     if is_llm_enabled():
         result = _llm_rank(state, estimates, perf_scores, eff_scores, stab_scores)
         if result is not None:
             return result
-    return _rule_rank(state, estimates, perf_scores, eff_scores, stab_scores, log_paths=log_paths)
+        # Explicit fallback source when LLM was requested/enabled but unavailable
+        return _rule_rank(
+            state,
+            estimates,
+            perf_scores,
+            eff_scores,
+            stab_scores,
+            log_paths=log_paths,
+            source="fallback",
+            update_log_path=update_log_path,
+            run_id=run_id,
+        )
+
+    effective_source = source
+    if effective_source is None:
+        effective_source = "hybrid" if has_learned_model else "rule"
+
+    return _rule_rank(
+        state,
+        estimates,
+        perf_scores,
+        eff_scores,
+        stab_scores,
+        log_paths=log_paths,
+        source=effective_source,
+        update_log_path=update_log_path,
+        run_id=run_id,
+    )

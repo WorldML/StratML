@@ -323,16 +323,23 @@ class DecisionEngine:
         eff_scores  = efficiency_agent.score(state, estimates)
         stab_scores = stability_agent.score(state, estimates)
 
-        ranked = coordinator_agent.rank(state, estimates, perf_scores, eff_scores, stab_scores)
+        update_log = self._out_dir / "decision_logs" / "coordinator_weight_updates.jsonl"
+        eval_log = self._out_dir / "decision_logs" / "evaluation_log.jsonl"
+        log_paths = [eval_log] if eval_log.exists() else None
 
-        # Determine decision source (P0-24)
-        if is_llm_enabled():
-            llm_decided = any(bool(r.rationale) for r in ranked)
-            decision_source = "llm" if llm_decided else "fallback"
-        else:
-            decision_source = "hybrid" if (self.enable_value_model and has_learned_model) else "rule"
+        ranked = coordinator_agent.rank(
+            state,
+            estimates,
+            perf_scores,
+            eff_scores,
+            stab_scores,
+            log_paths=log_paths,
+            has_learned_model=(self.enable_value_model and has_learned_model),
+            update_log_path=update_log,
+            run_id=self.run_id,
+        )
 
-        decision = select(state, ranked, rng=self._rng, decision_source=decision_source)
+        decision = select(state, ranked, rng=self._rng)
 
         # Inject DL hyperparams when running in DL mode
         if self.dl_hyperparams and decision.action_type != "terminate":
