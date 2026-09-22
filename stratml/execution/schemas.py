@@ -105,6 +105,8 @@ class ExperimentResult(BaseModel):
     artifacts: ArtifactRefs
     early_stopped: Optional[bool] = None   # True if DL early stopping triggered
     best_epoch: Optional[int] = None       # epoch with lowest val loss (DL only)
+    status: Optional[str] = None           # e.g. "completed" or "failed"
+    failed: Optional[bool] = None          # True if run explicitly failed
 
 
 class ActionDecision(BaseModel):

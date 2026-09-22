@@ -47,7 +47,7 @@ def _cosine(a: list[float], b: list[float]) -> float:
 def retrieve_similar_actions(
     meta_features,
     top_k: int = _TOP_K,
-    history_mode: str = "independent",
+    history_mode: str = "all",
     current_run_id: Optional[str] = None,
     current_dataset_id: Optional[str] = None,
     current_dataset_fingerprint: Optional[str] = None,
@@ -93,6 +93,8 @@ def retrieve_similar_actions(
                 elif current_dataset_id and r_did:
                     if r_did == current_dataset_id:
                         filtered_records.append(r)
+                elif not current_dataset_fingerprint and not current_dataset_id and not r_did and not r_dfp:
+                    filtered_records.append(r)
             elif history_mode == "transfer":
                 if current_dataset_fingerprint and r_dfp:
                     if r_dfp != current_dataset_fingerprint:

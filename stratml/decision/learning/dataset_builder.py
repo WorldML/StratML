@@ -132,8 +132,21 @@ def record(
         _append(_UNIFIED_PATH, row, not _UNIFIED_PATH.exists())
 
 
-def backfill_last_gain(gain: float, status: str = "completed") -> None:
-    """Update observed_gain and normalized_gain of the last unfilled row in both CSVs."""
+def backfill_last_gain(
+    gain: float,
+    status: str = "completed",
+    run_id: str | None = None,
+    experiment_id: str | None = None,
+    iteration: int | None = None,
+    dataset_id: str | None = None,
+    dataset_fingerprint: str | None = None,
+) -> bool:
+    """Update observed_gain and normalized_gain of the matching pending row in both CSVs.
+
+    A completed observation must match its exact originating run_id, experiment_id,
+    iteration, and dataset identity/fingerprint to prevent cross-run contamination.
+    """
+    updated_any = False
     for path in {_DATASET_PATH, _UNIFIED_PATH}:
         if not path.exists():
             continue
@@ -142,15 +155,32 @@ def backfill_last_gain(gain: float, status: str = "completed") -> None:
             rows = list(_csv.DictReader(path.open(encoding="utf-8")))
             if not rows:
                 continue
-            # Find last row with empty observed_gain
+
+            # Find matching row with empty observed_gain
             for row in reversed(rows):
-                if row.get("observed_gain", "").strip() == "":
-                    row["observed_gain"] = str(round(gain, 6))
-                    best = float(row.get("best_score") or 0.0)
-                    headroom = 1.0 - best
-                    row["normalized_gain"] = str(round(gain / headroom, 6)) if headroom > 1e-6 else str(round(gain, 6))
-                    row["status"] = status
-                    break
+                if row.get("observed_gain", "").strip() != "":
+                    continue
+
+                # Verify exact originating provenance match
+                if run_id is not None and row.get("run_id") != run_id:
+                    continue
+                if experiment_id is not None and row.get("experiment_id") != experiment_id:
+                    continue
+                if iteration is not None and str(row.get("iteration")) != str(iteration):
+                    continue
+                if dataset_id is not None and row.get("dataset_id") != dataset_id:
+                    continue
+                if dataset_fingerprint is not None and row.get("dataset_fingerprint") != dataset_fingerprint:
+                    continue
+
+                row["observed_gain"] = str(round(gain, 6))
+                best = float(row.get("best_score") or 0.0)
+                headroom = 1.0 - best
+                row["normalized_gain"] = str(round(gain / headroom, 6)) if headroom > 1e-6 else str(round(gain, 6))
+                row["status"] = status
+                updated_any = True
+                break
+
             with path.open("w", newline="", encoding="utf-8") as f:
                 writer = _csv.DictWriter(f, fieldnames=_COLUMNS, extrasaction="ignore")
                 writer.writeheader()
@@ -158,3 +188,5 @@ def backfill_last_gain(gain: float, status: str = "completed") -> None:
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("backfill_last_gain failed for %s: %s", path, exc)
+
+    return updated_any

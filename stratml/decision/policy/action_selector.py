@@ -82,27 +82,33 @@ def select(
     ranked: list[RankedAction],
     rng: Optional[random.Random] = None,
     seed: Optional[int] = None,
+    decision_source: Optional[str] = None,
 ) -> ActionDecision:
     """Pick an action using epsilon-greedy exploration, then return an ActionDecision."""
     local_rng = rng if rng is not None else (random.Random(seed) if seed is not None else random)
     if state.resources.budget_exhausted:
         best = next((r for r in ranked if r.action_type == "terminate"), ranked[0])
+        effective_source = "rule"
     else:
         epsilon = _EPSILON_LOW_DATA if _row_count() < _MIN_ROWS else _EPSILON_HIGH_DATA
         non_terminate = [r for r in ranked if r.action_type != "terminate"]
         if non_terminate:
-            if local_rng.random() < epsilon:
+            if decision_source == "llm":
+                best = non_terminate[0]
+                effective_source = "llm"
+            elif local_rng.random() < epsilon:
                 best = local_rng.choice(non_terminate)
+                effective_source = "fallback"
             else:
                 best = non_terminate[0]
+                effective_source = decision_source or ("learned" if getattr(best, "rationale", "") else "rule")
         else:
             best = ranked[0]
+            effective_source = decision_source or ("learned" if getattr(best, "rationale", "") else "rule")
 
     trigger = _infer_trigger(state)
     evidence = _build_evidence(state)
 
-    # If the coordinator produced a rationale, the LLM path was taken
-    source = "learned" if best.rationale else "rule"
     if best.rationale:
         evidence["rationale"] = best.rationale
 
@@ -119,7 +125,7 @@ def select(
         reason=DecisionReason(
             trigger=trigger,
             evidence=evidence,
-            source=source,
+            source=effective_source,
         ),
     )
 

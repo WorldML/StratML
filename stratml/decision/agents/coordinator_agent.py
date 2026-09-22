@@ -31,46 +31,144 @@ _W_EFF_DEFAULT  = 0.25
 _W_STAB_DEFAULT = 0.25
 _EMA_ALPHA = 0.2
 
+_CURRENT_WEIGHTS: dict[str, float] = {
+    "performance_weight": _W_PERF_DEFAULT,
+    "efficiency_weight": _W_EFF_DEFAULT,
+    "stability_weight": _W_STAB_DEFAULT,
+}
+
+_WEIGHT_UPDATE_HISTORY: list[dict] = []
+
+
+def get_current_weights() -> dict[str, float]:
+    """Return the coordinator weights used for the latest ranking."""
+    return dict(_CURRENT_WEIGHTS)
+
+
+def get_weight_update_history() -> list[dict]:
+    """Return the attributable audit trail of coordinator weight updates."""
+    return [dict(u) for u in _WEIGHT_UPDATE_HISTORY]
+
+
+def reset_weight_update_history() -> None:
+    """Reset coordinator weight update history to defaults."""
+    global _WEIGHT_UPDATE_HISTORY, _CURRENT_WEIGHTS
+    _WEIGHT_UPDATE_HISTORY = []
+    _CURRENT_WEIGHTS = {
+        "performance_weight": _W_PERF_DEFAULT,
+        "efficiency_weight": _W_EFF_DEFAULT,
+        "stability_weight": _W_STAB_DEFAULT,
+    }
+
+
+def _set_current_weights(w_p: float, w_e: float, w_s: float) -> None:
+    global _CURRENT_WEIGHTS
+    _CURRENT_WEIGHTS = {
+        "performance_weight": w_p,
+        "efficiency_weight": w_e,
+        "stability_weight": w_s,
+    }
+
 
 def _load_agent_weights(log_paths: list[str | Path] | None = None) -> tuple[float, float, float]:
-    """Compute per-agent EMA weights from evaluation_log.jsonl across all runs."""
+    """Compute per-agent EMA weights deterministically with full attributable audit trail."""
     import glob
     from pathlib import Path
     if log_paths is not None:
-        logs = [str(p) for p in log_paths]
+        logs = sorted([str(p) for p in log_paths])
     else:
-        logs = glob.glob("outputs/*/decision_logs/evaluation_log.jsonl")
+        logs = sorted(glob.glob("outputs/*/decision_logs/evaluation_log.jsonl"))
+
     if not logs:
-        return _W_PERF_DEFAULT, _W_EFF_DEFAULT, _W_STAB_DEFAULT
+        weights = (_W_PERF_DEFAULT, _W_EFF_DEFAULT, _W_STAB_DEFAULT)
+        _set_current_weights(*weights)
+        return weights
+
     try:
         import json
         records = []
         for log_path in logs:
-            with open(log_path) as f:
-                for line in f:
+            with open(log_path, encoding="utf-8") as f:
+                for idx, line in enumerate(f):
                     line = line.strip()
                     if line:
-                        records.append(json.loads(line))
+                        rec = json.loads(line)
+                        rec["_source_log"] = str(log_path)
+                        rec["_line_index"] = idx
+                        records.append(rec)
+
         if len(records) < 5:
-            return _W_PERF_DEFAULT, _W_EFF_DEFAULT, _W_STAB_DEFAULT
-        # Proxy: high validity + positive cf_impact => perf agent was right
-        # low quality_risk => stability agent was right
-        # low counterfactual_impact cost => efficiency agent was right
+            weights = (_W_PERF_DEFAULT, _W_EFF_DEFAULT, _W_STAB_DEFAULT)
+            _set_current_weights(*weights)
+            return weights
+
+        # Deterministic EMA weight updates with bounded values and attributable history
         w_p = w_e = w_s = 0.5
-        for r in records:
-            cf = r.get("counterfactual_impact", 0.0) or 0.0
-            validity = r.get("decision_validity", 0.5) or 0.5
-            risk = r.get("quality_risk", 0.5) or 0.5
-            perf_right = 1.0 if (validity >= 0.5 and cf >= 0) else 0.0
-            eff_right  = 1.0 if cf >= -0.02 else 0.0  # action didnt cost much
+        _WEIGHT_UPDATE_HISTORY.clear()
+
+        for idx, r in enumerate(records):
+            eval_id = r.get("experiment_id") or f"eval_{idx}"
+            iteration = r.get("iteration")
+
+            prev_total = w_p + w_e + w_s
+            prev_norm = {
+                "performance_weight": round(w_p / prev_total, 4),
+                "efficiency_weight": round(w_e / prev_total, 4),
+                "stability_weight": round(w_s / prev_total, 4),
+            }
+
+            cf = float(r.get("counterfactual_impact", 0.0) or 0.0)
+            validity = float(r.get("decision_validity", 0.5) or 0.5)
+            risk = float(r.get("quality_risk", 0.5) or 0.5)
+
+            perf_right = 1.0 if (validity >= 0.5 and cf >= 0.0) else 0.0
+            eff_right  = 1.0 if cf >= -0.02 else 0.0
             stab_right = 1.0 if risk < 0.5 else 0.0
-            w_p = (1 - _EMA_ALPHA) * w_p + _EMA_ALPHA * perf_right
-            w_e = (1 - _EMA_ALPHA) * w_e + _EMA_ALPHA * eff_right
-            w_s = (1 - _EMA_ALPHA) * w_s + _EMA_ALPHA * stab_right
-        total = w_p + w_e + w_s or 1.0
-        return round(w_p / total, 4), round(w_e / total, 4), round(w_s / total, 4)
-    except Exception:
-        return _W_PERF_DEFAULT, _W_EFF_DEFAULT, _W_STAB_DEFAULT
+
+            evidence = {
+                "counterfactual_impact": cf,
+                "decision_validity": validity,
+                "quality_risk": risk,
+                "perf_agent_correct": perf_right,
+                "eff_agent_correct": eff_right,
+                "stab_agent_correct": stab_right,
+            }
+
+            # Apply bounded EMA update (minimum 1e-4 so weights never collapse to zero)
+            w_p = max(1e-4, (1.0 - _EMA_ALPHA) * w_p + _EMA_ALPHA * perf_right)
+            w_e = max(1e-4, (1.0 - _EMA_ALPHA) * w_e + _EMA_ALPHA * eff_right)
+            w_s = max(1e-4, (1.0 - _EMA_ALPHA) * w_s + _EMA_ALPHA * stab_right)
+
+            new_total = w_p + w_e + w_s
+            new_norm = {
+                "performance_weight": round(w_p / new_total, 4),
+                "efficiency_weight": round(w_e / new_total, 4),
+                "stability_weight": round(w_s / new_total, 4),
+            }
+
+            _WEIGHT_UPDATE_HISTORY.append({
+                "update_index": idx,
+                "evaluation_id": eval_id,
+                "iteration": iteration,
+                "previous_weights": prev_norm,
+                "evidence": evidence,
+                "unnormalized_weights": {
+                    "performance": round(w_p, 6),
+                    "efficiency": round(w_e, 6),
+                    "stability": round(w_s, 6),
+                },
+                "new_weights": new_norm,
+            })
+
+        total = w_p + w_e + w_s
+        weights = (round(w_p / total, 4), round(w_e / total, 4), round(w_s / total, 4))
+        _set_current_weights(*weights)
+        return weights
+    except Exception as exc:
+        log.warning("Coordinator weight loading failed: %s", exc)
+        weights = (_W_PERF_DEFAULT, _W_EFF_DEFAULT, _W_STAB_DEFAULT)
+        _set_current_weights(*weights)
+        return weights
 
 
 @dataclass
@@ -97,7 +195,10 @@ def _rule_rank(
     stab_scores: dict[str, float],
     log_paths: list[str | Path] | None = None,
 ) -> list[RankedAction]:
-    w_p, w_e, w_s = _load_agent_weights(log_paths=log_paths)
+    if log_paths is not None:
+        w_p, w_e, w_s = _load_agent_weights(log_paths=log_paths)
+    else:
+        w_p, w_e, w_s = _load_agent_weights()
     ranked: list[RankedAction] = []
     for e in estimates:
         p  = perf_scores.get(e.action_type, 0.5)
@@ -189,7 +290,7 @@ def _llm_rank(
             ef = eff_scores.get(e.action_type, 0.5)
             st = stab_scores.get(e.action_type, 0.5)
             llm_item = llm_map.get(e.action_type)
-            final = round(max(0.0, min(llm_item.final_score, 1.0)), 4) if llm_item else round(_W_PERF * p + _W_EFF * ef + _W_STAB * st, 4)
+            final = round(max(0.0, min(llm_item.final_score, 1.0)), 4) if llm_item else round(_W_PERF_DEFAULT * p + _W_EFF_DEFAULT * ef + _W_STAB_DEFAULT * st, 4)
             rationale = llm_item.rationale if llm_item else ""
             ranked.append(RankedAction(
                 action_type=e.action_type,

@@ -25,7 +25,7 @@ from stratml.decision.learning.dataset_builder import record as record_dataset, 
 from stratml.decision.learning.value_model import predict
 from stratml.decision.learning.calibration import calibrate
 from stratml.decision.learning.uncertainty import estimate
-from stratml.decision.agents import performance_agent, efficiency_agent, stability_agent
+from stratml.decision.agents import performance_agent, efficiency_agent, stability_agent, coordinator_agent
 from stratml.decision.agents.coordinator_agent import rank
 from stratml.decision.policy.action_selector import select
 from stratml.decision.logging import decision_logger
@@ -52,6 +52,8 @@ class DecisionEngine:
         seed: int = 42,
         history_mode: str = "independent",
         llm_mode: Optional[bool] = None,
+        enable_meta_memory: bool = True,
+        enable_value_model: bool = True,
     ) -> None:
         self.primary_metric    = primary_metric
         self.optimization_goal = optimization_goal
@@ -63,6 +65,8 @@ class DecisionEngine:
         self.seed              = seed
         self._rng              = random.Random(seed)
         self.history_mode      = history_mode
+        self.enable_meta_memory = enable_meta_memory
+        self.enable_value_model = enable_value_model
 
         if not run_id:
             now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -78,6 +82,7 @@ class DecisionEngine:
         self._last_action: Optional[str]   = None
         self._last_action_success: Optional[bool] = None
         self._last_best_score: Optional[float]    = None  # for observed_gain backfill
+        self._dataset_fingerprint: Optional[str]  = None
         self._last_signals = None
         self._last_decision = None
 
@@ -147,13 +152,19 @@ class DecisionEngine:
                 self.optimization_goal = "maximize"
 
         meta = _extract_meta(profile)
-        similar_models = _meta_memory.retrieve_similar_actions(
-            meta,
-            history_mode=self.history_mode,
-            current_run_id=self.run_id,
-            current_dataset_id=profile.dataset_name,
-            current_dataset_fingerprint=self._dataset_fingerprint,
-        )
+        if self.enable_meta_memory:
+            try:
+                similar_models = _meta_memory.retrieve_similar_actions(
+                    meta,
+                    history_mode=self.history_mode,
+                    current_run_id=self.run_id,
+                    current_dataset_id=profile.dataset_name,
+                    current_dataset_fingerprint=self._dataset_fingerprint,
+                )
+            except TypeError:
+                similar_models = _meta_memory.retrieve_similar_actions(meta)
+        else:
+            similar_models = []
         allowed = self.allowed_models
         if similar_models and allowed:
             # Prioritise similar models by moving them to front
@@ -177,17 +188,41 @@ class DecisionEngine:
         metric_name = self.primary_metric or (
             "r2" if self._profile and self._profile.problem_type == "regression" else "accuracy"
         )
-        if self._last_action is not None and self._last_best_score is not None:
-            current_score = getattr(result.metrics, metric_name, None)
-            if current_score is None:
-                current_score = (
-                    getattr(result.metrics, "r2", None)
-                    if metric_name == "r2"
-                    else getattr(result.metrics, "accuracy", 0.0)
-                )
-            current_score = float(current_score or 0.0)
+        current_score = getattr(result.metrics, metric_name, None)
+        if current_score is None:
+            current_score = (
+                getattr(result.metrics, "r2", None)
+                if metric_name == "r2"
+                else getattr(result.metrics, "accuracy", 0.0)
+            )
+        current_score = float(current_score or 0.0)
+
+        # Determine action success/failure for S_(t+1) (P0-27)
+        is_failed = getattr(result, "failed", False) or getattr(result, "status", "") == "failed"
+        if is_failed:
+            action_success = False
+            gain = (current_score - self._last_best_score) if self._last_best_score is not None else 0.0
+        elif self._last_best_score is not None:
             gain = current_score - self._last_best_score
-            backfill_last_gain(gain)
+            if self.optimization_goal == "minimize":
+                action_success = (gain <= 0.0)
+            else:
+                action_success = (gain >= 0.0)
+        else:
+            gain = 0.0
+            action_success = True
+
+        self._last_action_success = action_success
+
+        if self._last_action is not None and self._last_decision is not None:
+            backfill_last_gain(
+                gain,
+                run_id=self.run_id,
+                experiment_id=self._last_decision.experiment_id,
+                iteration=self._last_decision.iteration,
+                dataset_id=self._profile.dataset_name if self._profile else None,
+                dataset_fingerprint=self._dataset_fingerprint,
+            )
 
             if self._best_val_score is None:
                 self._best_val_score = current_score
@@ -224,13 +259,63 @@ class DecisionEngine:
         if self._last_decision is not None:
             eval_log = self._out_dir / "decision_logs" / "evaluation_log.jsonl"
             evaluator_agent._EVAL_LOG = eval_log
-            evaluator_agent.audit(self._last_decision, result, state)
+            eval_record = evaluator_agent.audit(self._last_decision, result, state)
+
+            # Reconstructable trajectory (P0-25): Link execution result and evaluator result to previous decision record
+            next_state_id = f"{result.experiment_id}_{result.iteration}"
+            exec_summary = {
+                "experiment_id": result.experiment_id,
+                "iteration": result.iteration,
+                "model_name": result.model_name,
+                "metrics": result.metrics.model_dump(),
+                "runtime": result.runtime,
+                "action_success": self._last_action_success,
+                "gain": gain,
+            }
+            eval_summary = {
+                "decision_validity": getattr(eval_record, "decision_validity", None),
+                "quality_risk": getattr(eval_record, "quality_risk", None),
+                "counterfactual_impact": getattr(eval_record, "counterfactual_impact", None),
+                "action_verdict": getattr(eval_record, "action_verdict", None),
+                "rationale": getattr(eval_record, "rationale", None),
+            } if eval_record else None
+
+            decision_logger.update_outcome(
+                experiment_id=self._last_decision.experiment_id,
+                iteration=self._last_decision.iteration,
+                execution_result=exec_summary,
+                evaluator_result=eval_summary,
+                next_state_id=next_state_id,
+            )
         return self._decide(state)
 
     def _decide(self, state) -> ActionDecision:
         candidates: list[CandidateAction] = generate(state)
 
-        predictions = predict(state, candidates, seed=self.seed)
+        # P0-21: Value Model ablation control
+        if self.enable_value_model:
+            predictions = predict(state, candidates, seed=self.seed)
+            has_learned_model = False
+            try:
+                import pandas as pd
+                if _value_model._DATASET_PATH.exists():
+                    df = pd.read_csv(_value_model._DATASET_PATH)
+                    has_learned_model = (df.get("observed_gain") is not None and df["observed_gain"].notna().sum() >= 50)
+            except Exception:
+                has_learned_model = False
+        else:
+            from stratml.decision.learning.value_model import ValuePrediction
+            predictions = [
+                ValuePrediction(
+                    action_type=c.action_type,
+                    parameters=c.parameters,
+                    predicted_gain=0.05,
+                    predicted_cost=0.5,
+                )
+                for c in candidates
+            ]
+            has_learned_model = False
+
         calibrated  = calibrate(predictions)
         estimates   = estimate(calibrated, state)
 
@@ -238,13 +323,21 @@ class DecisionEngine:
         eff_scores  = efficiency_agent.score(state, estimates)
         stab_scores = stability_agent.score(state, estimates)
 
-        ranked   = rank(state, estimates, perf_scores, eff_scores, stab_scores)
-        decision = select(state, ranked, rng=self._rng)
+        ranked = coordinator_agent.rank(state, estimates, perf_scores, eff_scores, stab_scores)
+
+        # Determine decision source (P0-24)
+        if is_llm_enabled():
+            llm_decided = any(bool(r.rationale) for r in ranked)
+            decision_source = "llm" if llm_decided else "fallback"
+        else:
+            decision_source = "hybrid" if (self.enable_value_model and has_learned_model) else "rule"
+
+        decision = select(state, ranked, rng=self._rng, decision_source=decision_source)
 
         # Inject DL hyperparams when running in DL mode
         if self.dl_hyperparams and decision.action_type != "terminate":
             decision.parameters.update(self.dl_hyperparams)
-            
+
         # Find predicted_gain for the selected action
         selected_pred = next((p for p in predictions if p.action_type == decision.action_type), None)
         predicted_gain = selected_pred.predicted_gain if selected_pred else 0.0
@@ -258,28 +351,77 @@ class DecisionEngine:
             dataset_fingerprint=self._dataset_fingerprint,
             seed=self.seed,
         )
-        decision_logger.log(state, candidates, decision)
+
+        # Coordinator weights used for this decision (P0-23)
+        coordinator_weights = coordinator_agent.get_current_weights()
+        coordinator_weights["iteration"] = state.meta.iteration
+
+        # Ranked candidates information for runner-up traceability (P0-26)
+        ranked_candidates = [
+            {
+                "candidate": {
+                    "action_type": r.action_type,
+                    "parameters": r.parameters,
+                },
+                "predicted_gain": r.predicted_gain,
+                "predicted_cost": r.predicted_cost,
+                "confidence": r.confidence,
+                "agent_scores": {
+                    "performance": r.agent_scores.performance,
+                    "efficiency": r.agent_scores.efficiency,
+                    "stability": r.agent_scores.stability,
+                },
+                "final_score": r.final_score,
+                "rank": i + 1,
+                "selected": (r.action_type == decision.action_type and r.parameters == decision.parameters),
+                "rationale": r.rationale,
+            }
+            for i, r in enumerate(ranked)
+        ]
+
+        decision_logger.log(
+            state,
+            candidates,
+            decision,
+            coordinator_weights=coordinator_weights,
+            ranked_candidates=ranked_candidates,
+        )
+
         runner_up = ranked[1] if len(ranked) > 1 else None
         counterfactual.record(decision, runner_up)
 
         self._last_action         = decision.action_type
-        self._last_action_success = None
         self._last_best_score     = state.trajectory.best_score
         self._last_signals        = state.signals
         self._last_decision       = decision
+
         if decision.action_type == "terminate":
             # Backfill the terminate row immediately — no further result will arrive.
-            # gain=0.0 because termination produces no score change.
-            backfill_last_gain(0.0)
-            if self._profile is not None:
+            backfill_last_gain(
+                0.0,
+                run_id=self.run_id,
+                experiment_id=decision.experiment_id,
+                iteration=decision.iteration,
+                dataset_id=self._profile.dataset_name if self._profile else None,
+                dataset_fingerprint=self._dataset_fingerprint,
+            )
+            if self.enable_meta_memory and self._profile is not None:
                 meta = _extract_meta(self._profile)
                 best_model = self._best_model or (state.search.models_tried[-1] if state.search.models_tried else "unknown")
-                _meta_memory.record_run(
-                    meta,
-                    best_model,
-                    state.trajectory.best_score,
-                    self.run_id,
-                    dataset_id=self._profile.dataset_name,
-                    dataset_fingerprint=self._dataset_fingerprint,
-                )
+                try:
+                    _meta_memory.record_run(
+                        meta,
+                        best_model,
+                        state.trajectory.best_score,
+                        self.run_id,
+                        dataset_id=self._profile.dataset_name,
+                        dataset_fingerprint=self._dataset_fingerprint,
+                    )
+                except TypeError:
+                    _meta_memory.record_run(
+                        meta,
+                        best_model,
+                        state.trajectory.best_score,
+                        self.run_id,
+                    )
         return decision

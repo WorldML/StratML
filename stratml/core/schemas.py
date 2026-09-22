@@ -104,6 +104,8 @@ class ExperimentResult(BaseModel):
     # --- training metadata (DL-populated, None for ML) ---
     early_stopped: Optional[bool] = None   # True if early stopping triggered
     best_epoch: Optional[int] = None       # epoch index with lowest val loss
+    status: Optional[str] = None           # e.g. "completed" or "failed"
+    failed: Optional[bool] = None          # True if run explicitly failed
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +122,7 @@ class BootstrapContext(BaseModel):
 class DecisionReason(BaseModel):
     trigger: str
     evidence: dict = Field(default_factory=dict)
-    source: str = Field(default="rule", pattern="^(bootstrap|rule|learned)$")
+    source: str = Field(default="rule", pattern="^(bootstrap|rule|llm|value_model|hybrid|fallback|learned)$")
 
 
 def _coerce_reason(v):
@@ -353,3 +355,8 @@ class DecisionRecord(BaseModel):
     state_snapshot: StateObject
     candidate_actions: list[CandidateAction]
     selected_action: ActionDecision
+    coordinator_weights: Optional[dict[str, float]] = None
+    ranked_candidates: Optional[list[dict]] = None
+    execution_result: Optional[dict] = None
+    evaluator_result: Optional[dict] = None
+    next_state_id: Optional[str] = None

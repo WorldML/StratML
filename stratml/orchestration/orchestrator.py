@@ -70,6 +70,7 @@ class ExecutionOrchestrator:
         self.actual_evaluations = 0
         self.total_runtime = 0.0
         self.budget_accounting: dict = {}
+        self.manifest: dict | None = None
 
     def run(self, dataset_path: str, target_column: str) -> None:
         # ── Phase 1+2: Ingest and profile ────────────────────────────────────
@@ -357,3 +358,89 @@ class ExecutionOrchestrator:
         budget_path = artifacts_dir / "budget_accounting.json"
         budget_path.write_text(json.dumps(budget_accounting, indent=2))
         self.log(f"  Computational budget accounting saved to {budget_path}")
+
+        # ── Canonical Experiment Manifest (P0-30) ─────────────────────────────
+        from stratml.execution.pipelines.ml_pipeline import (
+            PAPER_CLASSIFICATION_MODELS,
+            PAPER_REGRESSION_MODELS,
+        )
+        from stratml.decision.actions.action_generator import PAPER_CLASSICAL_ACTIONS
+        from stratml.execution.config.ml_mutations import get_paper_mutation_space
+        from stratml.decision.llm_control import is_llm_enabled
+
+        engine = getattr(self.send_profile, "__self__", None)
+
+        llm_cfg = None
+        llm_file = artifacts_dir / "llm_config.json"
+        if llm_file.exists():
+            try:
+                llm_cfg = json.loads(llm_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        if llm_cfg is None and hasattr(engine, "llm_config"):
+            llm_cfg = getattr(engine, "llm_config")
+        if llm_cfg is None:
+            llm_cfg = {
+                "llm_mode_enabled": is_llm_enabled(),
+                "fallback_behavior": "rule_based",
+            }
+
+        import subprocess
+        try:
+            commit_hash = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).decode().strip()
+        except Exception:
+            commit_hash = "unknown"
+
+        manifest = {
+            "manifest_version": "1.0",
+            "run_id": self.run_id,
+            "dataset": {
+                "name": profile.dataset_name,
+                "path": str(dataset_path),
+                "rows": profile.rows,
+                "columns": profile.columns,
+                "target_column": target_column,
+            },
+            "dataset_fingerprint": getattr(profile, "dataset_fingerprint", None),
+            "task": profile.problem_type,
+            "seed": self.split_config.random_seed,
+            "budget": self.budget_accounting,
+            "model_space": list(
+                PAPER_REGRESSION_MODELS if profile.problem_type == "regression" else PAPER_CLASSIFICATION_MODELS
+            ),
+            "action_space": sorted(list(PAPER_CLASSICAL_ACTIONS)),
+            "hyperparameter_mutation_space": get_paper_mutation_space(),
+            "llm_configuration": llm_cfg,
+            "warm_start_mode_corpus": {
+                "history_mode": getattr(engine, "history_mode", "independent"),
+                "corpus_path": str(Path("runs/decision_logs/decision_dataset.csv")),
+                "meta_memory_path": str(Path("runs/decision_logs/meta_memory.jsonl")),
+                "enable_meta_memory": getattr(engine, "enable_meta_memory", True),
+                "enable_value_model": getattr(engine, "enable_value_model", True),
+            },
+            "stratml_version": {
+                "version": "0.1.0",
+                "commit": commit_hash,
+            },
+            "evaluation_configuration": {
+                "split_method": self.split_config.method,
+                "test_size": self.split_config.test_size,
+                "val_size": self.split_config.val_size,
+                "random_seed": self.split_config.random_seed,
+                "primary_metric": "r2" if profile.problem_type == "regression" else "accuracy",
+                "best_val_score": best_val_score if best_val_score != float("-inf") else None,
+                "best_iteration": best_iteration,
+                "best_model_name": getattr(best_config, "model_name", None),
+            },
+        }
+
+        manifest_path = Path("outputs") / self.run_id / "manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        self.manifest = manifest
+        self.log(f"  Experiment manifest saved to {manifest_path}")
+
