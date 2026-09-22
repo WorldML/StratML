@@ -142,7 +142,97 @@ class DecisionEngine:
         art_dir.mkdir(parents=True, exist_ok=True)
         (art_dir / "llm_config.json").write_text(json.dumps(self.llm_config, indent=2), encoding="utf-8")
 
+        # Capture warm-start start snapshot at experiment initialization (P1-28 & P1-30)
+        self._start_snapshot_locked = False
+        self._start_snapshot = None
+        self.start_snapshot = self.capture_start_snapshot()
+
+    def capture_start_snapshot(self, lock: bool = False) -> dict:
+        """Capture immutable start snapshot of historical experience at experiment initialization."""
+        if getattr(self, "_start_snapshot_locked", False) and getattr(self, "_start_snapshot", None) is not None:
+            return self._start_snapshot
+
+        import hashlib
+        from datetime import datetime, timezone
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if self.history_mode == "independent":
+            corpus_path = self._out_dir / "decision_logs" / "decision_dataset.csv"
+            meta_memory_path = self._out_dir / "decision_logs" / "meta_memory.jsonl"
+        else:
+            corpus_path = Path("runs/decision_logs/decision_dataset.csv")
+            meta_memory_path = Path("runs/decision_logs/meta_memory.jsonl")
+
+        def _compute_hash(p: Path) -> Optional[str]:
+            if not p.exists() or p.stat().st_size == 0:
+                return None
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                while chunk := f.read(65536):
+                    h.update(chunk)
+            return h.hexdigest()
+
+        # If value model is disabled, no decision corpus is consumed
+        if self.enable_value_model:
+            c_hash = _compute_hash(corpus_path)
+            c_path_str = str(corpus_path)
+        else:
+            c_hash = None
+            c_path_str = None
+
+        # If meta memory is disabled, no meta memory file is consumed
+        if self.enable_meta_memory:
+            m_hash = _compute_hash(meta_memory_path)
+            m_path_str = str(meta_memory_path)
+        else:
+            m_hash = None
+            m_path_str = None
+
+        condition = (
+            "full" if (self.enable_meta_memory and self.enable_value_model)
+            else ("MetaMemory OFF" if (not self.enable_meta_memory and self.enable_value_model)
+            else ("Value Model OFF" if (self.enable_meta_memory and not self.enable_value_model)
+            else "MetaMemory OFF, Value Model OFF"))
+        )
+
+        snapshot = {
+            "history_mode": self.history_mode,
+            "value_model_enabled": self.enable_value_model,
+            "meta_memory_enabled": self.enable_meta_memory,
+            "condition": condition,
+            "start_timestamp": now_iso,
+            "decision_corpus": {
+                "path": c_path_str,
+                "start_snapshot_hash": c_hash,
+                "snapshot_hash": c_hash,
+                "snapshot_timestamp": now_iso,
+                "initialization_marker": "captured_at_experiment_start",
+            },
+            "meta_memory": {
+                "path": m_path_str,
+                "start_snapshot_hash": m_hash,
+                "snapshot_hash": m_hash,
+                "snapshot_timestamp": now_iso,
+                "initialization_marker": "captured_at_experiment_start",
+            },
+        }
+
+        self._start_snapshot = snapshot
+        self.start_snapshot = snapshot
+        if lock:
+            self._start_snapshot_locked = True
+            try:
+                snap_path = self._out_dir / "artifacts" / "warm_start_start_snapshot.json"
+                snap_path.parent.mkdir(parents=True, exist_ok=True)
+                snap_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        return snapshot
+
     def receive_profile(self, profile: DataProfile) -> ActionDecision:
+        # Lock start snapshot before any decision or learning recording can occur
+        self.capture_start_snapshot(lock=True)
         self._profile = profile
         self._dataset_fingerprint = getattr(profile, "dataset_fingerprint", None)
         if not self._metric_explicit or self.primary_metric is None:

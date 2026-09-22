@@ -75,6 +75,25 @@ class ExecutionOrchestrator:
         self.manifest: dict | None = None
 
     def run(self, dataset_path: str, target_column: str) -> None:
+        # ── Capture start snapshot before any profiling, training, or decision cycle can mutate experience (P1-28 & P1-30) ──
+        engine = getattr(self.send_profile, "__self__", None)
+        if engine is not None and self.resolved_config and "ablations" in self.resolved_config:
+            if "enable_meta_memory" in self.resolved_config["ablations"]:
+                engine.enable_meta_memory = self.resolved_config["ablations"]["enable_meta_memory"]
+            if "enable_value_model" in self.resolved_config["ablations"]:
+                engine.enable_value_model = self.resolved_config["ablations"]["enable_value_model"]
+        if engine is not None and hasattr(engine, "capture_start_snapshot"):
+            self.start_snapshot = engine.capture_start_snapshot(lock=True)
+        else:
+            self.start_snapshot = self._capture_start_snapshot(engine)
+
+        try:
+            start_snapshot_path = Path("outputs") / self.run_id / "artifacts" / "warm_start_start_snapshot.json"
+            start_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            start_snapshot_path.write_text(json.dumps(self.start_snapshot, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
         # ── Phase 1+2: Ingest and profile ────────────────────────────────────
         self.log("  Loading dataset...")
         df, name = load_dataframe(dataset_path)
@@ -415,26 +434,25 @@ class ExecutionOrchestrator:
         else:
             condition = "MetaMemory OFF, Value Model OFF"
 
-        # Warm start paths and snapshot hashes (P1-28 + P1-30)
+        # Warm start start snapshot resolution (P1-28 & P1-30)
         history_mode = getattr(engine, "history_mode", "independent")
-        if history_mode == "independent":
-            corpus_path = Path("outputs") / self.run_id / "decision_logs" / "decision_dataset.csv"
-            meta_memory_path = Path("outputs") / self.run_id / "decision_logs" / "meta_memory.jsonl"
-        else:
-            corpus_path = Path("runs/decision_logs/decision_dataset.csv")
-            meta_memory_path = Path("runs/decision_logs/meta_memory.jsonl")
+        if not hasattr(self, "start_snapshot") or self.start_snapshot is None:
+            if engine is not None and hasattr(engine, "capture_start_snapshot"):
+                self.start_snapshot = engine.capture_start_snapshot(lock=True)
+            else:
+                self.start_snapshot = self._capture_start_snapshot(engine)
 
-        def _compute_hash(p: Path) -> Optional[str]:
-            if not p.exists() or p.stat().st_size == 0:
-                return None
-            h = hashlib.sha256()
-            with open(p, "rb") as f:
-                while chunk := f.read(65536):
-                    h.update(chunk)
-            return h.hexdigest()
+        start_corpus = self.start_snapshot.get("decision_corpus", {})
+        start_meta = self.start_snapshot.get("meta_memory", {})
+        start_corpus_hash = start_corpus.get("start_snapshot_hash")
+        start_meta_hash = start_meta.get("start_snapshot_hash")
+        corpus_path_val = start_corpus.get("path")
+        meta_path_val = start_meta.get("path")
 
-        corpus_snapshot_hash = _compute_hash(corpus_path)
-        meta_memory_snapshot_hash = _compute_hash(meta_memory_path)
+        if corpus_path_val is None and enable_vm:
+            corpus_path_val = str(Path("outputs") / self.run_id / "decision_logs" / "decision_dataset.csv" if history_mode == "independent" else Path("runs/decision_logs/decision_dataset.csv"))
+        if meta_path_val is None and enable_mm:
+            meta_path_val = str(Path("outputs") / self.run_id / "decision_logs" / "meta_memory.jsonl" if history_mode == "independent" else Path("runs/decision_logs/meta_memory.jsonl"))
 
         resolved_exp_config = {
             "seed": self.split_config.random_seed,
@@ -463,6 +481,27 @@ class ExecutionOrchestrator:
 
         config_hash = hashlib.sha256(json.dumps(resolved_exp_config, sort_keys=True).encode("utf-8")).hexdigest()
 
+        warm_start_dict = {
+            "history_mode": self.start_snapshot.get("history_mode", history_mode),
+            "value_model_enabled": self.start_snapshot.get("value_model_enabled", enable_vm),
+            "meta_memory_enabled": self.start_snapshot.get("meta_memory_enabled", enable_mm),
+            "condition": condition,
+            "decision_corpus": {
+                "path": corpus_path_val,
+                "start_snapshot_hash": start_corpus_hash,
+                "snapshot_hash": start_corpus_hash,
+                "snapshot_timestamp": start_corpus.get("snapshot_timestamp"),
+                "initialization_marker": "captured_at_experiment_start",
+            },
+            "meta_memory": {
+                "path": meta_path_val,
+                "start_snapshot_hash": start_meta_hash,
+                "snapshot_hash": start_meta_hash,
+                "snapshot_timestamp": start_meta.get("snapshot_timestamp"),
+                "initialization_marker": "captured_at_experiment_start",
+            },
+        }
+
         manifest = {
             "manifest_version": "1.0",
             "run_id": self.run_id,
@@ -486,16 +525,22 @@ class ExecutionOrchestrator:
             "resolved_experiment_config": resolved_exp_config,
             "config_hash": config_hash,
             "condition": condition,
+            "start_snapshot_hash": start_corpus_hash,
+            "warm_start": warm_start_dict,
             "warm_start_mode_corpus": {
-                "history_mode": history_mode,
-                "corpus_path": str(corpus_path),
-                "corpus_snapshot_hash": corpus_snapshot_hash,
-                "meta_memory_path": str(meta_memory_path),
-                "meta_memory_snapshot_hash": meta_memory_snapshot_hash,
+                "history_mode": self.start_snapshot.get("history_mode", history_mode),
+                "corpus_path": corpus_path_val,
+                "corpus_snapshot_hash": start_corpus_hash,
+                "start_snapshot_hash": start_corpus_hash,
+                "meta_memory_path": meta_path_val,
+                "meta_memory_snapshot_hash": start_meta_hash,
+                "meta_memory_start_snapshot_hash": start_meta_hash,
                 "enable_meta_memory": enable_mm,
                 "enable_value_model": enable_vm,
                 "condition": condition,
                 "dataset_fingerprint": getattr(profile, "dataset_fingerprint", None),
+                "decision_corpus": warm_start_dict["decision_corpus"],
+                "meta_memory": warm_start_dict["meta_memory"],
             },
             "stratml_version": {
                 "version": "0.1.0",
@@ -518,4 +563,65 @@ class ExecutionOrchestrator:
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         self.manifest = manifest
         self.log(f"  Experiment manifest saved to {manifest_path}")
+
+    def _capture_start_snapshot(self, engine=None) -> dict:
+        import hashlib
+        from datetime import datetime, timezone
+
+        history_mode = getattr(engine, "history_mode", "independent")
+        enable_vm = getattr(engine, "enable_value_model", True)
+        enable_mm = getattr(engine, "enable_meta_memory", True)
+        if self.resolved_config and "ablations" in self.resolved_config:
+            enable_mm = self.resolved_config["ablations"].get("enable_meta_memory", enable_mm)
+            enable_vm = self.resolved_config["ablations"].get("enable_value_model", enable_vm)
+
+        if history_mode == "independent":
+            corpus_path = Path("outputs") / self.run_id / "decision_logs" / "decision_dataset.csv"
+            meta_memory_path = Path("outputs") / self.run_id / "decision_logs" / "meta_memory.jsonl"
+        else:
+            corpus_path = Path("runs/decision_logs/decision_dataset.csv")
+            meta_memory_path = Path("runs/decision_logs/meta_memory.jsonl")
+
+        def _compute_hash(p: Path) -> Optional[str]:
+            if not p.exists() or p.stat().st_size == 0:
+                return None
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                while chunk := f.read(65536):
+                    h.update(chunk)
+            return h.hexdigest()
+
+        c_hash = _compute_hash(corpus_path) if enable_vm else None
+        m_hash = _compute_hash(meta_memory_path) if enable_mm else None
+        c_path = str(corpus_path) if enable_vm else None
+        m_path = str(meta_memory_path) if enable_mm else None
+
+        condition = (
+            "full" if (enable_mm and enable_vm)
+            else ("MetaMemory OFF" if (not enable_mm and enable_vm)
+            else ("Value Model OFF" if (enable_mm and not enable_vm)
+            else "MetaMemory OFF, Value Model OFF"))
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        return {
+            "history_mode": history_mode,
+            "value_model_enabled": enable_vm,
+            "meta_memory_enabled": enable_mm,
+            "condition": condition,
+            "start_timestamp": now_iso,
+            "decision_corpus": {
+                "path": c_path,
+                "start_snapshot_hash": c_hash,
+                "snapshot_hash": c_hash,
+                "snapshot_timestamp": now_iso,
+                "initialization_marker": "captured_at_experiment_start",
+            },
+            "meta_memory": {
+                "path": m_path,
+                "start_snapshot_hash": m_hash,
+                "snapshot_hash": m_hash,
+                "snapshot_timestamp": now_iso,
+                "initialization_marker": "captured_at_experiment_start",
+            },
+        }
 

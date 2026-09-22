@@ -303,7 +303,9 @@ class TestP1_24_SourceAttributionAndFallbackParticipation:
                 source="hybrid",
             )
         ]
-        decision = select(state, ranked, decision_source="hybrid")
+        mock_rng = MagicMock()
+        mock_rng.random.return_value = 1.0
+        decision = select(state, ranked, rng=mock_rng, decision_source="hybrid")
         assert decision.reason.source == "hybrid"
         assert decision.reason.selection_mode == "greedy"
         assert decision.reason.fallback_participation is False
@@ -515,11 +517,207 @@ class TestP1_27_ExecutionStatusVsActionOutcome:
 # ---------------------------------------------------------------------------
 
 class TestP1_28_30_WarmStartProvenanceAndManifest:
+    def test_1_start_snapshot_captured_before_mutation(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        runs_dir = tmp_path / "runs" / "decision_logs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        corpus_file = runs_dir / "decision_dataset.csv"
+        from stratml.decision.learning.dataset_builder import _COLUMNS
+        initial_corpus_content = ",".join(_COLUMNS) + "\n" + ",".join(["0"] * len(_COLUMNS)) + "\n"
+        corpus_file.write_text(initial_corpus_content, encoding="utf-8")
+        hash_A = hashlib.sha256(corpus_file.read_bytes()).hexdigest()
+
+        run_id = f"test_p1_test1_{uuid.uuid4().hex[:6]}"
+        dummy_csv = tmp_path / "data.csv"
+        df = pd.DataFrame({"f1": [1.0, 2.0] * 10, "f2": [0.1, 0.2] * 10, "target": [0, 1] * 10})
+        df.to_csv(dummy_csv, index=False)
+
+        engine = DecisionEngine(run_id=run_id, history_mode="continual", max_iterations=1)
+        orch = ExecutionOrchestrator(
+            send_profile=engine.receive_profile,
+            send_result=engine.receive_result,
+            run_id=run_id,
+            max_iterations=1,
+            tune=False,
+        )
+        orch.run(str(dummy_csv), "target")
+
+        # Run appended new observations B to the corpus
+        final_corpus_bytes = corpus_file.read_bytes()
+        hash_AB = hashlib.sha256(final_corpus_bytes).hexdigest()
+        assert hash_AB != hash_A, "Run must have appended new data to the continual corpus"
+
+        # Manifest must record start snapshot hash == hash(A), NOT hash(A+B)
+        manifest_path = Path("outputs") / run_id / "manifest.json"
+        assert manifest_path.exists()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        assert manifest["start_snapshot_hash"] == hash_A
+        assert manifest["start_snapshot_hash"] != hash_AB
+        assert manifest["warm_start"]["decision_corpus"]["start_snapshot_hash"] == hash_A
+        assert manifest["warm_start"]["decision_corpus"]["start_snapshot_hash"] != hash_AB
+        assert manifest["warm_start"]["decision_corpus"]["initialization_marker"] == "captured_at_experiment_start"
+
+        # Artifact must also record start snapshot
+        snap_artifact = Path("outputs") / run_id / "artifacts" / "warm_start_start_snapshot.json"
+        assert snap_artifact.exists()
+        snap_data = json.loads(snap_artifact.read_text(encoding="utf-8"))
+        assert snap_data["decision_corpus"]["start_snapshot_hash"] == hash_A
+
+    def test_2_independent_run(self, tmp_path):
+        run_id = f"test_p1_test2_{uuid.uuid4().hex[:6]}"
+        engine = DecisionEngine(run_id=run_id, history_mode="independent", max_iterations=1)
+        dummy_csv = tmp_path / "data.csv"
+        df = pd.DataFrame({"f1": [1.0, 2.0] * 10, "f2": [0.1, 0.2] * 10, "target": [0, 1] * 10})
+        df.to_csv(dummy_csv, index=False)
+
+        orch = ExecutionOrchestrator(
+            send_profile=engine.receive_profile,
+            send_result=engine.receive_result,
+            run_id=run_id,
+            max_iterations=1,
+            tune=False,
+        )
+        orch.run(str(dummy_csv), "target")
+
+        manifest_path = Path("outputs") / run_id / "manifest.json"
+        assert manifest_path.exists()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        warm = manifest["warm_start"]
+        assert warm["history_mode"] == "independent"
+        # Must record the actual isolated run-specific path, not shared runs/
+        expected_corpus_path = str(Path("outputs") / run_id / "decision_logs" / "decision_dataset.csv")
+        expected_meta_path = str(Path("outputs") / run_id / "decision_logs" / "meta_memory.jsonl")
+        assert warm["decision_corpus"]["path"] == expected_corpus_path
+        assert warm["meta_memory"]["path"] == expected_meta_path
+        assert "runs/decision_logs" not in warm["decision_corpus"]["path"]
+
+    def test_3_continual_transfer(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        runs_dir = tmp_path / "runs" / "decision_logs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        hist_corpus = runs_dir / "decision_dataset.csv"
+        from stratml.decision.learning.dataset_builder import _COLUMNS
+        hist_corpus.write_text(",".join(_COLUMNS) + "\n" + ",".join(["0"] * len(_COLUMNS)) + "\n", encoding="utf-8")
+        hist_meta = runs_dir / "meta_memory.jsonl"
+        hist_meta.write_text('{"reflection": "prior experience"}\n', encoding="utf-8")
+
+        expected_corpus_hash = hashlib.sha256(hist_corpus.read_bytes()).hexdigest()
+        expected_meta_hash = hashlib.sha256(hist_meta.read_bytes()).hexdigest()
+
+        run_id = f"test_p1_test3_{uuid.uuid4().hex[:6]}"
+        dummy_csv = tmp_path / "data.csv"
+        df = pd.DataFrame({"f1": [1.0, 2.0] * 10, "f2": [0.1, 0.2] * 10, "target": [0, 1] * 10})
+        df.to_csv(dummy_csv, index=False)
+
+        engine = DecisionEngine(run_id=run_id, history_mode="continual", max_iterations=1)
+        orch = ExecutionOrchestrator(
+            send_profile=engine.receive_profile,
+            send_result=engine.receive_result,
+            run_id=run_id,
+            max_iterations=1,
+            tune=False,
+        )
+        orch.run(str(dummy_csv), "target")
+
+        manifest_path = Path("outputs") / run_id / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        warm = manifest["warm_start"]
+        assert warm["history_mode"] == "continual"
+        assert warm["decision_corpus"]["path"] == str(Path("runs/decision_logs/decision_dataset.csv"))
+        assert warm["meta_memory"]["path"] == str(Path("runs/decision_logs/meta_memory.jsonl"))
+        assert warm["decision_corpus"]["start_snapshot_hash"] == expected_corpus_hash
+        assert warm["meta_memory"]["start_snapshot_hash"] == expected_meta_hash
+
+    def test_4_both_learning_mechanisms_disabled(self, tmp_path):
+        run_id = f"test_p1_test4_{uuid.uuid4().hex[:6]}"
+        engine = DecisionEngine(
+            run_id=run_id,
+            enable_meta_memory=False,
+            enable_value_model=False,
+            max_iterations=1,
+        )
+        cfg = {
+            "mode": "beginner",
+            "ablations": {
+                "enable_meta_memory": False,
+                "enable_value_model": False,
+                "condition": "MetaMemory OFF, Value Model OFF",
+            }
+        }
+        dummy_csv = tmp_path / "data.csv"
+        df = pd.DataFrame({"f1": [1.0, 2.0] * 10, "f2": [0.1, 0.2] * 10, "target": [0, 1] * 10})
+        df.to_csv(dummy_csv, index=False)
+
+        orch = ExecutionOrchestrator(
+            send_profile=engine.receive_profile,
+            send_result=engine.receive_result,
+            run_id=run_id,
+            max_iterations=1,
+            resolved_config=cfg,
+        )
+        orch.run(str(dummy_csv), "target")
+
+        manifest_path = Path("outputs") / run_id / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        warm = manifest["warm_start"]
+        assert warm["value_model_enabled"] is False
+        assert warm["meta_memory_enabled"] is False
+        assert warm["condition"] == "MetaMemory OFF, Value Model OFF"
+        # Does not invent unconsumed corpus or meta memory paths/hashes
+        assert warm["decision_corpus"]["path"] is None
+        assert warm["decision_corpus"]["start_snapshot_hash"] is None
+        assert warm["meta_memory"]["path"] is None
+        assert warm["meta_memory"]["start_snapshot_hash"] is None
+        assert manifest["start_snapshot_hash"] is None
+
+    def test_5_immutable_evidence(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        runs_dir = tmp_path / "runs" / "decision_logs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        corpus_file = runs_dir / "decision_dataset.csv"
+        from stratml.decision.learning.dataset_builder import _COLUMNS
+        corpus_file.write_text(",".join(_COLUMNS) + "\n" + ",".join(["0"] * len(_COLUMNS)) + "\n", encoding="utf-8")
+        hash_start = hashlib.sha256(corpus_file.read_bytes()).hexdigest()
+
+        run_id = f"test_p1_test5_{uuid.uuid4().hex[:6]}"
+        dummy_csv = tmp_path / "data.csv"
+        df = pd.DataFrame({"f1": [1.0, 2.0] * 10, "f2": [0.1, 0.2] * 10, "target": [0, 1] * 10})
+        df.to_csv(dummy_csv, index=False)
+
+        engine = DecisionEngine(run_id=run_id, history_mode="continual", max_iterations=1)
+        orch = ExecutionOrchestrator(
+            send_profile=engine.receive_profile,
+            send_result=engine.receive_result,
+            run_id=run_id,
+            max_iterations=1,
+            tune=False,
+        )
+        orch.run(str(dummy_csv), "target")
+
+        # After the experiment has finished, mutate the corpus drastically
+        with open(corpus_file, "a", encoding="utf-8") as f:
+            f.write("ds_mutated,999,additional_corrupt_data\n")
+
+        # Re-reading the manifest must still give the original start snapshot identity
+        manifest_path = Path("outputs") / run_id / "manifest.json"
+        manifest_after_mutation = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        assert manifest_after_mutation["start_snapshot_hash"] == hash_start
+        assert manifest_after_mutation["warm_start"]["decision_corpus"]["start_snapshot_hash"] == hash_start
+        assert manifest_after_mutation["warm_start"]["decision_corpus"]["start_snapshot_hash"] != hashlib.sha256(corpus_file.read_bytes()).hexdigest()
+
+        # Artifact must also retain original start snapshot identity
+        snap_artifact = Path("outputs") / run_id / "artifacts" / "warm_start_start_snapshot.json"
+        snap_data = json.loads(snap_artifact.read_text(encoding="utf-8"))
+        assert snap_data["decision_corpus"]["start_snapshot_hash"] == hash_start
+
     def test_independent_mode_corpus_path_and_hash(self, tmp_path):
         run_id = f"test_p1_28_{uuid.uuid4().hex[:6]}"
         engine = DecisionEngine(run_id=run_id, history_mode="independent", max_iterations=1)
-        profile = _make_dummy_profile(fingerprint="test_fp_456")
-
         dummy_csv = tmp_path / "data.csv"
         df = pd.DataFrame({"f1": [1.0, 2.0] * 10, "f2": [0.1, 0.2] * 10, "target": [0, 1] * 10})
         df.to_csv(dummy_csv, index=False)
@@ -548,3 +746,4 @@ class TestP1_28_30_WarmStartProvenanceAndManifest:
         assert len(m["config_hash"]) == 64  # sha256 hex string
         assert m["resolved_experiment_config"]["budget"]["tune"] is False
         assert m["resolved_experiment_config"]["seed"] == 42
+
