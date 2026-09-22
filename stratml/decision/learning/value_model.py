@@ -46,7 +46,11 @@ _MODEL_VOCAB: dict[str, int] = {
     m: i for i, m in enumerate([
         "RandomForestClassifier", "LogisticRegression", "GradientBoostingClassifier",
         "ExtraTreesClassifier", "SVC", "KNeighborsClassifier", "GaussianNB",
-        "DecisionTreeClassifier", "none",
+        "DecisionTreeClassifier",
+        "RandomForestRegressor", "GradientBoostingRegressor", "ExtraTreesRegressor",
+        "DecisionTreeRegressor", "Ridge", "Lasso", "ElasticNet", "LinearRegression",
+        "KNeighborsRegressor", "SVR",
+        "none",
     ])
 }
 

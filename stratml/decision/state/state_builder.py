@@ -121,6 +121,8 @@ def build_state(
     if history is None:
         history = ExperimentHistory()
     history.push(result)
+    if profile is not None and getattr(profile, "problem_type", None) == "regression" and primary_metric == "accuracy":
+        primary_metric = "r2"
     traj = history.compute_trajectory(primary_metric)
 
     improvement_rate = traj.improvement_rate

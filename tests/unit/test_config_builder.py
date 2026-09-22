@@ -102,3 +102,67 @@ class TestPreprocessingPassthrough:
     def test_experiment_id_preserved(self):
         config = build_experiment_config(_action("switch_model", {"model_name": "SVC"}))
         assert config.experiment_id == "exp_test"
+
+
+class TestCanonicalActionExecution:
+    def test_add_preprocessing_updates_preprocessing_config(self):
+        prep = PreprocessingConfig(
+            missing_value_strategy="mean", scaling="standard",
+            encoding="onehot", imbalance_strategy="none", feature_selection="none",
+        )
+        # Action with strategy="oversample"
+        config = build_experiment_config(
+            _action("add_preprocessing", {"model_name": "RandomForestClassifier", "strategy": "oversample"}, prep=prep)
+        )
+        assert config.preprocessing.imbalance_strategy == "oversample"
+
+    def test_change_optimizer_raises_on_classical_model(self):
+        with pytest.raises(ValueError, match="only supported for deep learning"):
+            build_experiment_config(
+                _action("change_optimizer", {"model_name": "RandomForestClassifier", "learning_rate_scale": 0.1})
+            )
+
+    def test_unfreeze_backbone_raises_on_classical_model(self):
+        with pytest.raises(ValueError, match="only supported for deep learning"):
+            build_experiment_config(
+                _action("unfreeze_backbone", {"model_name": "LogisticRegression", "n_layers": 1})
+            )
+
+    def test_switch_architecture_raises_on_classical_model(self):
+        with pytest.raises(ValueError, match="only supported for deep learning"):
+            build_experiment_config(
+                _action("switch_architecture", {"model_name": "SVC", "new_arch": "CNN1D"})
+            )
+
+
+class TestHyperparameterMutationDeterminism:
+    @pytest.mark.parametrize("model_name,param,higher_is_more_capacity", [
+        ("RandomForestClassifier", "n_estimators", True),
+        ("GradientBoostingClassifier", "n_estimators", True),
+        ("DecisionTreeClassifier", "max_depth", True),
+        ("LogisticRegression", "C", True),
+        ("SVC", "C", True),
+        ("KNeighborsClassifier", "n_neighbors", False),
+    ])
+    def test_capacity_increase_and_decrease(self, model_name, param, higher_is_more_capacity):
+        # 1. Increase capacity
+        inc_config = build_experiment_config(
+            _action("increase_model_capacity", {"model_name": model_name, "scale": 1.5})
+        )
+        val_inc = inc_config.hyperparameters.get(param)
+        assert val_inc is not None, f"Model {model_name} missing {param} after increase_capacity"
+
+        # 2. Decrease capacity
+        dec_config = build_experiment_config(
+            _action("decrease_model_capacity", {"model_name": model_name, "scale": 0.75})
+        )
+        val_dec = dec_config.hyperparameters.get(param)
+        assert val_dec is not None, f"Model {model_name} missing {param} after decrease_capacity"
+
+        # 3. Direction and difference check
+        assert val_inc != val_dec
+        if higher_is_more_capacity:
+            assert val_inc > val_dec, f"{model_name}: expected val_inc ({val_inc}) > val_dec ({val_dec}) for {param}"
+        else:
+            assert val_inc < val_dec, f"{model_name}: expected val_inc ({val_inc}) < val_dec ({val_dec}) for {param}"
+

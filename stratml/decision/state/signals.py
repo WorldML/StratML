@@ -20,9 +20,19 @@ from typing import Any
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
-from langgraph.prebuilt import create_react_agent
-from langchain_core.tools import tool
-from langchain_groq import ChatGroq  # requires langchain-groq
+try:
+    from langchain_core.tools import tool
+except ImportError:
+    def tool(fn):
+        fn.func = fn
+        return fn
+
+try:
+    from langgraph.prebuilt import create_react_agent
+    from langchain_groq import ChatGroq
+except ImportError:
+    create_react_agent = None
+    ChatGroq = None
 
 from stratml.core.schemas import StateObject, StateSignals
 

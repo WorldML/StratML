@@ -6,6 +6,7 @@ execution:
   max_iterations: 5
   timeout_per_run: 300
   random_seed: 42
+  tune: false  # strict paper protocol: 1 decision iteration = 1 model fit (no nested CV search)
 split:
   method: stratified
   test_size: 0.2

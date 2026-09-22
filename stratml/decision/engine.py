@@ -36,7 +36,7 @@ from stratml.decision.learning import value_model as _value_model
 class DecisionEngine:
     def __init__(
         self,
-        primary_metric: str = "accuracy",
+        primary_metric: Optional[str] = None,
         optimization_goal: str = "maximize",
         allowed_models: Optional[list[str]] = None,
         max_iterations: int = 20,
@@ -46,6 +46,7 @@ class DecisionEngine:
     ) -> None:
         self.primary_metric    = primary_metric
         self.optimization_goal = optimization_goal
+        self._metric_explicit  = primary_metric is not None
         self.allowed_models    = allowed_models
         self.max_iterations    = max_iterations
         self.time_budget       = time_budget
@@ -76,6 +77,14 @@ class DecisionEngine:
 
     def receive_profile(self, profile: DataProfile) -> ActionDecision:
         self._profile = profile
+        if not self._metric_explicit or self.primary_metric is None:
+            if profile.problem_type == "regression":
+                self.primary_metric = "r2"
+                self.optimization_goal = "maximize"
+            else:
+                self.primary_metric = "accuracy"
+                self.optimization_goal = "maximize"
+
         meta = _extract_meta(profile)
         similar_models = _meta_memory.retrieve_similar_actions(meta)
         allowed = self.allowed_models
@@ -97,8 +106,18 @@ class DecisionEngine:
 
     def receive_result(self, result: ExperimentResult) -> ActionDecision:
         # Backfill observed_gain for the previous decision row
+        metric_name = self.primary_metric or (
+            "r2" if self._profile and self._profile.problem_type == "regression" else "accuracy"
+        )
         if self._last_action is not None and self._last_best_score is not None:
-            current_score = getattr(result.metrics, self.primary_metric, None) or 0.0
+            current_score = getattr(result.metrics, metric_name, None)
+            if current_score is None:
+                current_score = (
+                    getattr(result.metrics, "r2", None)
+                    if metric_name == "r2"
+                    else getattr(result.metrics, "accuracy", 0.0)
+                )
+            current_score = current_score or 0.0
             gain = current_score - self._last_best_score
             backfill_last_gain(gain)
 
@@ -112,7 +131,7 @@ class DecisionEngine:
             result,
             history=self._history,
             profile=self._profile,
-            primary_metric=self.primary_metric,
+            primary_metric=metric_name,
             optimization_goal=self.optimization_goal,
             allowed_models=self.allowed_models,
             max_iterations=self.max_iterations,

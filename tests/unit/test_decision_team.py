@@ -813,9 +813,12 @@ class TestCoordinatorAdaptiveWeights:
 
 class TestEvaluatorAgent:
     def _audit(self, action_type="switch_model", trigger="underfitting",
-               accuracy=0.78, train_loss=0.18, val_loss=0.20, **state_kwargs):
+               accuracy=0.78, train_loss=0.18, val_loss=0.20,
+               expected_gain=0.05, best_score=None, **state_kwargs):
         from stratml.decision.agents.evaluator_agent import _rule_audit
-        decision = _make_decision(action_type=action_type, trigger=trigger)
+        decision = _make_decision(action_type=action_type, trigger=trigger, expected_gain=expected_gain)
+        if best_score is not None:
+            decision.reason.evidence["best_score"] = best_score
         result = _make_result(accuracy=accuracy, train_loss=train_loss, val_loss=val_loss)
         state = _make_state(train_loss=train_loss, val_loss=val_loss, **state_kwargs)
         return _rule_audit(decision, result, state)
@@ -848,15 +851,15 @@ class TestEvaluatorAgent:
 
     def test_inconsistent_when_signal_absent(self):
         rec = self._audit(trigger="underfitting", underfitting="none", well_fitted="strong")
-        assert rec.reasoning_consistency < 1.0
+        assert rec.reasoning_consistency == 0.3
 
     def test_bootstrap_always_consistent(self):
         rec = self._audit(trigger="bootstrap")
         assert rec.reasoning_consistency == 1.0
 
     # --- quality_risk ---
-    def test_high_gap_increases_risk(self):
-        low_risk = self._audit(train_loss=0.10, val_loss=0.11)
+    def test_quality_risk_increases_with_gap(self):
+        low_risk  = self._audit(train_loss=0.18, val_loss=0.20)
         high_risk = self._audit(train_loss=0.10, val_loss=0.35)
         assert high_risk.quality_risk > low_risk.quality_risk
 
@@ -871,12 +874,58 @@ class TestEvaluatorAgent:
 
     # --- counterfactual_impact ---
     def test_positive_impact_when_accuracy_exceeds_expected(self):
-        rec = self._audit(accuracy=0.90)  # expected_gain=0.05 by default
+        rec = self._audit(accuracy=0.90)  # expected_gain=0.05 by default, best_score=0.78
         assert rec.counterfactual_impact > 0
 
     def test_negative_impact_when_accuracy_below_expected(self):
         rec = self._audit(accuracy=0.01)
         assert rec.counterfactual_impact < 0
+
+    def test_exact_counterfactual_impact_positive(self):
+        # previous=0.80, current=0.82, expected=0.01 -> (0.82 - 0.80) - 0.01 = +0.01
+        rec = self._audit(best_score=0.80, accuracy=0.82, expected_gain=0.01)
+        assert rec.counterfactual_impact == 0.01
+
+    def test_exact_counterfactual_impact_zero(self):
+        # previous=0.80, current=0.81, expected=0.01 -> (0.81 - 0.80) - 0.01 = 0.00
+        rec = self._audit(best_score=0.80, accuracy=0.81, expected_gain=0.01)
+        assert rec.counterfactual_impact == 0.0
+
+    def test_exact_counterfactual_impact_negative(self):
+        # previous=0.80, current=0.78, expected=0.01 -> (0.78 - 0.80) - 0.01 = -0.03
+        rec = self._audit(best_score=0.80, accuracy=0.78, expected_gain=0.01)
+        assert rec.counterfactual_impact == -0.03
+
+    def test_llm_cannot_override_counterfactual_impact(self, monkeypatch):
+        from stratml.decision.agents import evaluator_agent
+        from unittest.mock import MagicMock
+        mock_chat = MagicMock()
+        mock_structured = MagicMock()
+        mock_output = MagicMock()
+        mock_output.decision_validity = 0.9
+        mock_output.reasoning_consistency = 0.9
+        mock_output.quality_risk = 0.1
+        mock_output.counterfactual_impact = 999.0
+        mock_output.fault_detected = False
+        mock_output.notes = "all good"
+        mock_structured.invoke.return_value = mock_output
+        mock_chat.return_value.with_structured_output.return_value = mock_structured
+
+        monkeypatch.setattr("os.getenv", lambda k, default=None: "fake_key" if k == "GROQ_API_KEY" else default)
+
+        import sys
+        mock_module = MagicMock()
+        mock_module.ChatGroq = mock_chat
+        monkeypatch.setitem(sys.modules, "langchain_groq", mock_module)
+        monkeypatch.setitem(sys.modules, "langchain_core.messages", MagicMock())
+
+        decision = _make_decision(expected_gain=0.01)
+        decision.reason.evidence["best_score"] = 0.80
+        result = _make_result(accuracy=0.82)
+        state = _make_state()
+        rec = evaluator_agent._llm_audit(decision, result, state)
+        assert rec is not None
+        assert rec.counterfactual_impact == 0.01
 
     # --- fault_detected ---
     def test_fault_detected_on_invalid_action(self):

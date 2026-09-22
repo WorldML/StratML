@@ -33,16 +33,26 @@ _DEFAULT_MODELS = [
     "DecisionTreeClassifier",
 ]
 
-_BOOTSTRAP_MODELS = [
-    "RandomForestClassifier",
-    "LogisticRegression",
-    "GradientBoostingClassifier",
-    "ExtraTreesClassifier",
-    "KNeighborsClassifier",
-    "GaussianNB",
-    "SVC",
-    "DecisionTreeClassifier",
+_DEFAULT_REGRESSION_MODELS = [
+    "RandomForestRegressor",
+    "GradientBoostingRegressor",
+    "ExtraTreesRegressor",
+    "DecisionTreeRegressor",
+    "Ridge",
+    "Lasso",
+    "ElasticNet",
+    "KNeighborsRegressor",
 ]
+
+_BOOTSTRAP_MODELS = _DEFAULT_MODELS
+
+
+def _get_default_models(state: StateObject) -> list[str]:
+    is_reg = state.objective.primary_metric in ("r2", "mse", "rmse") or (
+        state.dataset and getattr(state.dataset, "problem_type", None) == "regression"
+    )
+    return _DEFAULT_REGRESSION_MODELS if is_reg else _DEFAULT_MODELS
+
 
 _VALID_ACTION_TYPES = {
     "switch_model",
@@ -87,7 +97,7 @@ def generate(state: StateObject) -> list[CandidateAction]:
 # ---------------------------------------------------------------------------
 
 def _bootstrap_candidates(state: StateObject) -> list[CandidateAction]:
-    allowed = state.constraints.allowed_models or _BOOTSTRAP_MODELS
+    allowed = state.constraints.allowed_models or _get_default_models(state)
     return [
         CandidateAction(action_type="switch_model", parameters={"model_name": m})
         for m in allowed[:2]
@@ -126,7 +136,7 @@ def _llm_candidates(state: StateObject) -> Optional[list[CandidateAction]]:
 
         sig = state.signals
         traj = state.trajectory
-        allowed = state.constraints.allowed_models or _DEFAULT_MODELS
+        allowed = state.constraints.allowed_models or _get_default_models(state)
         tried = state.search.models_tried
         untried = [m for m in allowed if m not in tried]
 
@@ -192,7 +202,7 @@ def _rule_candidates(state: StateObject) -> list[CandidateAction]:
     if model_type == "dl":
         return _rule_candidates_dl(state, modality)
 
-    allowed = state.constraints.allowed_models or _DEFAULT_MODELS
+    allowed = state.constraints.allowed_models or _get_default_models(state)
     tried = set(state.search.models_tried)
     untried = [m for m in allowed if m not in tried]
 
@@ -221,7 +231,10 @@ def _rule_candidates(state: StateObject) -> list[CandidateAction]:
             candidates.append(CandidateAction(action_type="switch_model", parameters={"model_name": untried[0]}))
 
     if sig.diverging != "none":
-        candidates.append(CandidateAction(action_type="change_optimizer", parameters={"learning_rate_scale": 0.1}))
+        candidates.append(CandidateAction(action_type="modify_regularization", parameters={"direction": "increase"}))
+        candidates.append(CandidateAction(action_type="decrease_model_capacity", parameters={"scale": 0.75}))
+        if untried:
+            candidates.append(CandidateAction(action_type="switch_model", parameters={"model_name": untried[0]}))
 
     if sig.diminishing_returns != "none":
         if untried:

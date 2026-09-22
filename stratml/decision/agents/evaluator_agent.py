@@ -32,7 +32,7 @@ _EVAL_LOG = Path("runs/decision_logs/evaluation_log.jsonl")  # overridden by eng
 # Expected action types per trigger (rule-based validity check)
 _TRIGGER_EXPECTED: dict[str, set[str]] = {
     "underfitting":        {"switch_model", "increase_model_capacity"},
-    "overfitting":         {"switch_model", "modify_regularization", "decrease_model_capacity"},
+    "overfitting":         {"switch_model", "modify_regularization", "decrease_model_capacity", "add_preprocessing"},
     "stagnation":          {"switch_model", "change_optimizer"},
     "divergence":          {"change_optimizer", "decrease_model_capacity"},
     "diminishing_returns": {"switch_model"},
@@ -86,12 +86,7 @@ def _rule_audit(decision: ActionDecision, result: ExperimentResult, state: State
     risk = min(1.0, gap / 0.2 * 0.6 + (0.4 if sig.unstable_training != "none" else 0.0))
 
     # Counterfactual impact: actual gain vs expected
-    _metric_name = decision.reason.evidence.get("primary_metric") or "accuracy"
-    if not isinstance(_metric_name, str):
-        _metric_name = "accuracy"
-    primary = getattr(result.metrics, _metric_name, None) or 0.0
-    expected_gain = decision.expected_gain or 0.0
-    cf_impact = round(primary - expected_gain, 4)
+    cf_impact = _compute_cf_impact(decision, result, state)
 
     fault = validity < 0.5 or consistency < 0.5
     notes = []
@@ -112,6 +107,21 @@ def _rule_audit(decision: ActionDecision, result: ExperimentResult, state: State
         fault_detected=fault,
         notes="; ".join(notes),
     )
+
+
+def _compute_cf_impact(decision: ActionDecision, result: ExperimentResult, state: StateObject) -> float:
+    _metric_name = decision.reason.evidence.get("primary_metric") or "accuracy"
+    if not isinstance(_metric_name, str):
+        _metric_name = "accuracy"
+    primary = getattr(result.metrics, _metric_name, None)
+    if primary is None:
+        primary = 0.0
+    previous_best = decision.reason.evidence.get("best_score")
+    if previous_best is None:
+        previous_best = getattr(state.trajectory, "best_score", 0.0) or 0.0
+    actual_gain = primary - previous_best
+    expected_gain = decision.expected_gain or 0.0
+    return round(actual_gain - expected_gain, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +171,8 @@ def _llm_audit(decision: ActionDecision, result: ExperimentResult, state: StateO
         llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0).with_structured_output(_AuditOutput)
         out: _AuditOutput = llm.invoke([SystemMessage(_SYSTEM_PROMPT), HumanMessage(human)])
 
+        cf_impact = _compute_cf_impact(decision, result, state)
+
         return EvaluationRecord(
             experiment_id=decision.experiment_id,
             iteration=decision.iteration,
@@ -169,7 +181,7 @@ def _llm_audit(decision: ActionDecision, result: ExperimentResult, state: StateO
             decision_validity=round(max(0.0, min(out.decision_validity, 1.0)), 4),
             reasoning_consistency=round(max(0.0, min(out.reasoning_consistency, 1.0)), 4),
             quality_risk=round(max(0.0, min(out.quality_risk, 1.0)), 4),
-            counterfactual_impact=round(out.counterfactual_impact, 4),
+            counterfactual_impact=cf_impact,
             fault_detected=out.fault_detected,
             notes=out.notes,
         )

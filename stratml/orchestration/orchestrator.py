@@ -111,7 +111,7 @@ class ExecutionOrchestrator:
 
             # ── Phase 4b: Apply preprocessing ────────────────────────────────
             clean_split, applied_preprocessing = apply_preprocessing(
-                base_split, config.preprocessing, profile
+                base_split, config.preprocessing, profile, transform_test=False
             )
 
             # ── Phase 5: Train ────────────────────────────────────────────────
@@ -193,7 +193,7 @@ class ExecutionOrchestrator:
                 import joblib
                 best_model = joblib.load(best_model_path)
                 # Apply same preprocessing as last iteration to test split
-                test_split, _ = apply_preprocessing(base_split, config.preprocessing, profile)
+                test_split, _ = apply_preprocessing(base_split, config.preprocessing, profile, transform_test=True)
                 y_test_pred = best_model.predict(test_split.X_test)
                 test_metrics = compute_metrics(
                     y_true=test_split.y_test,

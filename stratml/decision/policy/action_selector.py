@@ -46,16 +46,34 @@ _TREE_MODELS = {
 }
 
 
-def _build_preprocessing(state: StateObject) -> PreprocessingConfig:
+def _build_preprocessing(state: StateObject, action_type: str = "", parameters: dict | None = None) -> PreprocessingConfig:
+    parameters = parameters or {}
     imbalance = "oversample" if (state.dataset.imbalance_ratio or 1.0) > 2.0 else "none"
     missing = "median" if (state.dataset.missing_ratio or 0.0) > 0.1 else "mean"
     scaling = "none" if state.model.model_name in _TREE_MODELS else "standard"
+    feature_selection = "none"
+
+    if action_type in ("add_preprocessing", "apply_preprocessing"):
+        strat = parameters.get("strategy")
+        if strat in ("oversample", "undersample", "none"):
+            imbalance = strat
+        elif strat in ("standard", "minmax", "robust"):
+            scaling = strat
+        if "imbalance_strategy" in parameters:
+            imbalance = parameters["imbalance_strategy"]
+        if "scaling" in parameters:
+            scaling = parameters["scaling"]
+        if "missing_value_strategy" in parameters:
+            missing = parameters["missing_value_strategy"]
+        if "feature_selection" in parameters:
+            feature_selection = parameters["feature_selection"]
+
     return PreprocessingConfig(
         missing_value_strategy=missing,
         scaling=scaling,
         encoding="onehot",
         imbalance_strategy=imbalance,
-        feature_selection="none",
+        feature_selection=feature_selection,
     )
 
 
@@ -81,7 +99,7 @@ def select(state: StateObject, ranked: list[RankedAction]) -> ActionDecision:
         iteration=state.meta.iteration,
         action_type=best.action_type,
         parameters=best.parameters,
-        preprocessing=_build_preprocessing(state),
+        preprocessing=_build_preprocessing(state, best.action_type, best.parameters),
         expected_gain=best.predicted_gain,
         expected_cost=best.predicted_cost,
         confidence=best.confidence,
