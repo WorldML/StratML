@@ -148,6 +148,7 @@ def run_pipeline(args):
     from stratml.reporting.report_generator import generate_report
     from pathlib import Path as _Path
     import shutil as _shutil
+    import uuid as _uuid
     from datetime import datetime as _dt, timezone as _tz
 
     allowed_models = (
@@ -156,8 +157,9 @@ def run_pipeline(args):
         or None
     )
 
+    seed = e.get("random_seed", 42)
     dataset_name = _Path(d["path"]).stem
-    run_id  = f"{dataset_name}_{_dt.now(_tz.utc).strftime('%Y%m%d_%H%M%S')}"
+    run_id  = f"{dataset_name}_{_dt.now(_tz.utc).strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
     out_dir = _Path("outputs") / run_id
 
     engine = DecisionEngine(
@@ -165,6 +167,7 @@ def run_pipeline(args):
         time_budget=e.get("timeout_per_run"),
         allowed_models=allowed_models,
         run_id=run_id,
+        seed=seed,
     )
 
     def _log(msg): print(msg)
@@ -175,6 +178,7 @@ def run_pipeline(args):
         split_config=SplitConfig(
             method=config["split"]["method"],
             test_size=config["split"]["test_size"],
+            random_seed=seed,
         ),
         time_budget=e.get("timeout_per_run"),
         run_id=run_id,

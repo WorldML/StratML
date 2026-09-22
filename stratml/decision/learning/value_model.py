@@ -65,8 +65,20 @@ class ValuePrediction:
     predicted_cost: float
 
 
-def _load_training_data(csv_path: Path):
-    """Return (X, y) arrays from the CSV, or (None, None) if insufficient data."""
+_HISTORY_MODE = "all"
+
+
+def _load_training_data(
+    csv_path: Path,
+    current_run_id: Optional[str] = None,
+    current_dataset_id: Optional[str] = None,
+    history_mode: str = "all",
+):
+    """Return (X, y) arrays from the CSV, or (None, None) if insufficient data.
+
+    Validates schema integrity, filters by history_mode (all, independent, continual, transfer),
+    and ignores incomplete or failed rows.
+    """
     if not csv_path.exists():
         return None, None
     try:
@@ -74,7 +86,41 @@ def _load_training_data(csv_path: Path):
         import numpy as np
 
         df = pd.read_csv(csv_path)
-        df = df[df["observed_gain"].notna() & (df["observed_gain"] != "")]
+        if df.empty:
+            return None, None
+
+        # Filter out incomplete or failed observations
+        if "status" in df.columns:
+            df = df[df["status"] == "completed"]
+
+        # Valid numeric observed_gain is required
+        df = df[df["observed_gain"].notna()]
+        df = df[df["observed_gain"].astype(str).str.strip() != ""]
+        df["observed_gain"] = pd.to_numeric(df["observed_gain"], errors="coerce")
+        df = df[df["observed_gain"].notna()]
+
+        # Strict feature verification — ensure expected columns exist and are not missing
+        required_feature_cols = [
+            "best_score", "improvement_rate", "slope", "volatility",
+            "steps_since_improvement", "num_samples", "num_features",
+            "missing_ratio", "runtime", "remaining_budget",
+            "action_type", "model_name",
+        ]
+        for col in required_feature_cols:
+            if col not in df.columns:
+                return None, None
+            df = df[df[col].notna()]
+
+        # Apply history mode provenance filtering
+        if "run_id" in df.columns and current_run_id:
+            if history_mode == "independent":
+                df = df[df["run_id"] == current_run_id]
+        if "dataset_id" in df.columns and current_dataset_id:
+            if history_mode == "continual":
+                df = df[df["dataset_id"] == current_dataset_id]
+            elif history_mode == "transfer":
+                df = df[df["dataset_id"] != current_dataset_id]
+
         if len(df) < _MIN_ROWS:
             return None, None
 
@@ -84,10 +130,12 @@ def _load_training_data(csv_path: Path):
             "missing_ratio", "runtime", "remaining_budget",
         ]
         df["action_type_enc"] = df["action_type"].map(_ACTION_VOCAB).fillna(len(_ACTION_VOCAB))
-        # model_name_enc and complexity_hint_enc may not exist in older rows — default 0
-        df["model_name_enc"] = df.get("model_name", "none").map(_MODEL_VOCAB).fillna(len(_MODEL_VOCAB))
-        df["complexity_hint_enc"] = df.get("complexity_hint", "none").map(_COMPLEXITY_VOCAB).fillna(0)
-        X = df[feature_cols + ["action_type_enc", "model_name_enc", "complexity_hint_enc"]].fillna(0).values
+        df["model_name_enc"] = df["model_name"].map(_MODEL_VOCAB).fillna(len(_MODEL_VOCAB))
+        if "complexity_hint" in df.columns:
+            df["complexity_hint_enc"] = df["complexity_hint"].map(_COMPLEXITY_VOCAB).fillna(0)
+        else:
+            df["complexity_hint_enc"] = 0.0
+        X = df[feature_cols + ["action_type_enc", "model_name_enc", "complexity_hint_enc"]].astype(float).values
         y = df["observed_gain"].astype(float).values
         return X, y
     except Exception as exc:
@@ -112,7 +160,17 @@ def _encode_state_action(state: StateObject, action_type: str) -> list[float]:
 
 def predict(state: StateObject, candidates: list[CandidateAction]) -> list[ValuePrediction]:
     """Predict (gain, cost) per candidate. Uses RF model when data is sufficient."""
-    X_train, y_train = _load_training_data(_DATASET_PATH)
+    run_id = getattr(state.meta, "run_id", None)
+    dataset_id = (
+        getattr(state.dataset, "dataset_id", None)
+        or getattr(state.dataset, "dataset_name", None)
+    )
+    X_train, y_train = _load_training_data(
+        _DATASET_PATH,
+        current_run_id=run_id,
+        current_dataset_id=dataset_id,
+        history_mode=_HISTORY_MODE,
+    )
 
     if X_train is not None:
         try:

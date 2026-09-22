@@ -19,30 +19,15 @@ from typing import Optional
 from pydantic import BaseModel
 
 from stratml.core.schemas import CandidateAction, StateObject
+from stratml.execution.pipelines.ml_pipeline import (
+    PAPER_CLASSIFICATION_MODELS,
+    PAPER_REGRESSION_MODELS,
+)
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_MODELS = [
-    "RandomForestClassifier",
-    "LogisticRegression",
-    "GradientBoostingClassifier",
-    "ExtraTreesClassifier",
-    "SVC",
-    "KNeighborsClassifier",
-    "GaussianNB",
-    "DecisionTreeClassifier",
-]
-
-_DEFAULT_REGRESSION_MODELS = [
-    "RandomForestRegressor",
-    "GradientBoostingRegressor",
-    "ExtraTreesRegressor",
-    "DecisionTreeRegressor",
-    "Ridge",
-    "Lasso",
-    "ElasticNet",
-    "KNeighborsRegressor",
-]
+_DEFAULT_MODELS = PAPER_CLASSIFICATION_MODELS
+_DEFAULT_REGRESSION_MODELS = PAPER_REGRESSION_MODELS
 
 _BOOTSTRAP_MODELS = _DEFAULT_MODELS
 
@@ -53,6 +38,15 @@ def _get_default_models(state: StateObject) -> list[str]:
     )
     return _DEFAULT_REGRESSION_MODELS if is_reg else _DEFAULT_MODELS
 
+
+PAPER_CLASSICAL_ACTIONS: set[str] = {
+    "switch_model",
+    "increase_model_capacity",
+    "decrease_model_capacity",
+    "modify_regularization",
+    "add_preprocessing",
+    "terminate",
+}
 
 _VALID_ACTION_TYPES = {
     "switch_model",
@@ -83,15 +77,23 @@ _DL_TOO_SLOW_FALLBACK = {
 
 def generate(state: StateObject) -> list[CandidateAction]:
     """Return candidate actions for the current state."""
+    is_dl = getattr(state.model, "model_type", "ml") == "dl"
     if state.resources.budget_exhausted:
-        return [CandidateAction(action_type="terminate", parameters={})]
-    if state.meta.iteration == 0:
-        return _bootstrap_candidates(state)
-    if os.getenv("GROQ_API_KEY"):
+        result = [CandidateAction(action_type="terminate", parameters={})]
+    elif state.meta.iteration == 0:
+        result = _bootstrap_candidates(state)
+    elif os.getenv("GROQ_API_KEY"):
         result = _llm_candidates(state)
-        if result is not None:
-            return result
-    return _rule_candidates(state)
+        if result is None:
+            result = _rule_candidates(state)
+    else:
+        result = _rule_candidates(state)
+
+    if not is_dl:
+        result = [c for c in result if c.action_type in PAPER_CLASSICAL_ACTIONS]
+        if not any(c.action_type == "terminate" for c in result):
+            result.append(CandidateAction(action_type="terminate", parameters={}))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +112,7 @@ def _bootstrap_candidates(state: StateObject) -> list[CandidateAction]:
 # LLM path
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = (
+_CLASSICAL_SYSTEM_PROMPT = (
     "You are an ML experimentation strategist. Given the current experiment state, "
     "propose a list of candidate next actions. You may suggest actions the rules don't "
     "cover, compose specific parameter values (e.g., a concrete alpha for regularization "
@@ -118,8 +120,19 @@ _SYSTEM_PROMPT = (
     "characteristics. Always include 'terminate' as one candidate — it is a valid choice "
     "at any point if the situation warrants it. "
     "Valid action_types: switch_model, increase_model_capacity, decrease_model_capacity, "
-    "modify_regularization, change_optimizer, add_preprocessing, terminate."
+    "modify_regularization, add_preprocessing, terminate."
 )
+
+_DL_SYSTEM_PROMPT = (
+    "You are an ML experimentation strategist. Given the current experiment state, "
+    "propose a list of candidate next actions. You may suggest actions the rules don't "
+    "cover, compose specific parameter values, or recommend a specific architecture. "
+    "Always include 'terminate' as one candidate. "
+    "Valid action_types: switch_model, increase_model_capacity, decrease_model_capacity, "
+    "modify_regularization, change_optimizer, unfreeze_backbone, switch_architecture, add_preprocessing, terminate."
+)
+
+_SYSTEM_PROMPT = _CLASSICAL_SYSTEM_PROMPT
 
 
 class _CandidateItem(BaseModel):
@@ -160,16 +173,16 @@ def _llm_candidates(state: StateObject) -> Optional[list[CandidateAction]]:
             "Propose 2-4 candidate actions as a JSON list. Each must have action_type and parameters."
         )
 
-        llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.2).with_structured_output(_CandidateList)
-        output: _CandidateList = llm.invoke([SystemMessage(_SYSTEM_PROMPT), HumanMessage(human)])
-
-        _dl_only = {"early_stop", "change_optimizer", "unfreeze_backbone", "switch_architecture"}
         is_dl = getattr(state.model, "model_type", "ml") == "dl"
+        prompt = _DL_SYSTEM_PROMPT if is_dl else _CLASSICAL_SYSTEM_PROMPT
+
+        llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.2).with_structured_output(_CandidateList)
+        output: _CandidateList = llm.invoke([SystemMessage(prompt), HumanMessage(human)])
+
         candidates = [
             CandidateAction(action_type=item.action_type, parameters=item.parameters)
             for item in output.candidates
-            if item.action_type in _VALID_ACTION_TYPES
-            and (is_dl or item.action_type not in _dl_only)
+            if (item.action_type in _VALID_ACTION_TYPES if is_dl else item.action_type in PAPER_CLASSICAL_ACTIONS)
         ]
 
         if not candidates:

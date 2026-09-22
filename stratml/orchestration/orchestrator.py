@@ -110,12 +110,12 @@ class ExecutionOrchestrator:
             self.log(f"  Training : {current_model} ({action.action_type}) ...")
 
             # ── Phase 4: Translate ActionDecision → ExperimentConfig ─────────
-            config = build_experiment_config(action, tune=self.tune)
+            config = build_experiment_config(action, tune=self.tune, seed=self.split_config.random_seed)
             current_hyperparameters = dict(config.hyperparameters)
 
             # ── Phase 4b: Apply preprocessing ────────────────────────────────
             clean_split, applied_preprocessing = apply_preprocessing(
-                base_split, config.preprocessing, profile, transform_test=False
+                base_split, config.preprocessing, profile, transform_test=False, seed=self.split_config.random_seed
             )
 
             # ── Phase 5: Train ────────────────────────────────────────────────
@@ -222,7 +222,7 @@ class ExecutionOrchestrator:
                 best_model = joblib.load(best_model_path)
                 # Apply EXACT preprocessing from the best validation iteration to the test split
                 test_split, _ = apply_preprocessing(
-                    base_split, best_config.preprocessing, profile, transform_test=True
+                    base_split, best_config.preprocessing, profile, transform_test=True, seed=self.split_config.random_seed
                 )
                 y_test_pred = best_model.predict(test_split.X_test)
                 test_metrics = compute_metrics(

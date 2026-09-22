@@ -24,30 +24,70 @@ _DATASET_PATH = Path("runs/decision_logs/decision_dataset.csv")
 _UNIFIED_PATH = Path("runs/decision_logs/decision_dataset.csv")
 
 _COLUMNS = [
-    "experiment_id", "iteration",
-    "primary_metric", "best_score", "improvement_rate", "slope", "volatility",
-    "steps_since_improvement", "trend",
-    "underfitting", "overfitting", "well_fitted", "converged", "stagnating",
-    "num_samples", "num_features", "missing_ratio",
-    "runtime", "remaining_budget",
-    "action_type", "action_params", "predicted_gain",
+    "dataset_id",
+    "run_id",
+    "seed",
+    "experiment_id",
+    "iteration",
+    "primary_metric",
+    "best_score",
+    "improvement_rate",
+    "slope",
+    "volatility",
+    "steps_since_improvement",
+    "trend",
+    "underfitting",
+    "overfitting",
+    "well_fitted",
+    "converged",
+    "stagnating",
+    "num_samples",
+    "num_features",
+    "missing_ratio",
+    "runtime",
+    "remaining_budget",
+    "model_name",
+    "complexity_hint",
+    "action_type",
+    "action_params",
+    "predicted_gain",
     "observed_gain",       # backfilled by backfill_last_gain()
     "normalized_gain",     # observed_gain / (1 - best_score_at_decision), cross-dataset comparable
+    "status",              # "pending", "completed", "failed", "incomplete"
 ]
 
 
 def _append(path: Path, row: dict, write_header: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=_COLUMNS)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_COLUMNS, extrasaction="ignore")
         if write_header:
             writer.writeheader()
         writer.writerow(row)
 
 
-def record(state: StateObject, action: CandidateAction, predicted_gain: float = 0.0) -> None:
+def record(
+    state: StateObject,
+    action: CandidateAction,
+    predicted_gain: float = 0.0,
+    run_id: str | None = None,
+    dataset_id: str | None = None,
+    seed: int | None = None,
+) -> None:
     """Append a row for the selected action. observed_gain left blank until backfilled."""
+    eff_run_id = run_id or getattr(state.meta, "run_id", None) or "unknown_run"
+    eff_dataset_id = (
+        dataset_id
+        or getattr(state.dataset, "dataset_id", None)
+        or getattr(state.dataset, "dataset_name", None)
+        or "unknown_dataset"
+    )
+    eff_seed = seed if seed is not None else getattr(state.meta, "seed", 42)
+
     row = {
+        "dataset_id": eff_dataset_id,
+        "run_id": eff_run_id,
+        "seed": eff_seed,
         "experiment_id": state.meta.experiment_id,
         "iteration": state.meta.iteration,
         "primary_metric": state.objective.primary_metric,
@@ -67,11 +107,14 @@ def record(state: StateObject, action: CandidateAction, predicted_gain: float = 
         "missing_ratio": state.dataset.missing_ratio,
         "runtime": state.resources.runtime,
         "remaining_budget": state.resources.remaining_budget,
+        "model_name": state.model.model_name or "none",
+        "complexity_hint": state.model.complexity_hint or "none",
         "action_type": action.action_type,
         "action_params": str(action.parameters),
         "predicted_gain": predicted_gain,
         "observed_gain": "",
         "normalized_gain": "",
+        "status": "pending",
     }
 
     _append(_DATASET_PATH, row, not _DATASET_PATH.exists())
@@ -81,7 +124,7 @@ def record(state: StateObject, action: CandidateAction, predicted_gain: float = 
         _append(_UNIFIED_PATH, row, not _UNIFIED_PATH.exists())
 
 
-def backfill_last_gain(gain: float) -> None:
+def backfill_last_gain(gain: float, status: str = "completed") -> None:
     """Update observed_gain and normalized_gain of the last unfilled row in both CSVs."""
     for path in {_DATASET_PATH, _UNIFIED_PATH}:
         if not path.exists():
@@ -98,9 +141,10 @@ def backfill_last_gain(gain: float) -> None:
                     best = float(row.get("best_score") or 0.0)
                     headroom = 1.0 - best
                     row["normalized_gain"] = str(round(gain / headroom, 6)) if headroom > 1e-6 else str(round(gain, 6))
+                    row["status"] = status
                     break
             with path.open("w", newline="", encoding="utf-8") as f:
-                writer = _csv.DictWriter(f, fieldnames=_COLUMNS)
+                writer = _csv.DictWriter(f, fieldnames=_COLUMNS, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(rows)
         except Exception as exc:

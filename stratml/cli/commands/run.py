@@ -99,8 +99,10 @@ def run_pipeline(args) -> None:
         )
         dl_hyperparams = None
 
+    import uuid
+    seed = e.get("random_seed", 42)
     dataset_name = Path(d["path"]).stem
-    run_id       = f"{dataset_name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    run_id       = f"{dataset_name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     out_dir      = Path("outputs") / run_id
 
     engine = DecisionEngine(
@@ -109,6 +111,7 @@ def run_pipeline(args) -> None:
         allowed_models=allowed_models,
         run_id=run_id,
         dl_hyperparams=dl_hyperparams,
+        seed=seed,
     )
 
     ExecutionOrchestrator(
@@ -117,6 +120,7 @@ def run_pipeline(args) -> None:
         split_config=SplitConfig(
             method=config["split"]["method"],
             test_size=config["split"]["test_size"],
+            random_seed=seed,
         ),
         time_budget=e.get("timeout_per_run"),
         run_id=run_id,

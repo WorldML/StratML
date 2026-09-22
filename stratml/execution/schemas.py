@@ -132,6 +132,7 @@ class ExperimentConfig(BaseModel):
     early_stopping: bool = False
     early_stopping_patience: int = 5
     tune: bool = False  # when True, ml_pipeline runs RandomizedSearchCV
+    seed: int = 42
 
 
 @dataclass

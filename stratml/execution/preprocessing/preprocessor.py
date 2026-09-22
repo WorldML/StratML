@@ -24,6 +24,7 @@ def apply_preprocessing(
     config: PreprocessingConfig,
     profile: DataProfile,
     transform_test: bool = False,
+    seed: int = 42,
 ) -> tuple[DataSplit, PreprocessingConfig]:
     """
     Apply preprocessing steps to DataSplit.
@@ -120,10 +121,10 @@ def apply_preprocessing(
         try:
             if config.imbalance_strategy == "oversample":
                 from imblearn.over_sampling import SMOTE
-                sampler = SMOTE(random_state=42)
+                sampler = SMOTE(random_state=seed)
             else:
                 from imblearn.under_sampling import RandomUnderSampler
-                sampler = RandomUnderSampler(random_state=42)
+                sampler = RandomUnderSampler(random_state=seed)
             X_train_arr, y_train_arr = sampler.fit_resample(X_train, y_train)
             X_train = pd.DataFrame(X_train_arr, columns=X_train.columns)
             y_train = pd.Series(y_train_arr, name=y_train.name)

@@ -79,6 +79,30 @@ MODEL_REGISTRY: dict = {
     "LinearDiscriminantAnalysis": LinearDiscriminantAnalysis,
 }
 
+PAPER_CLASSIFICATION_MODELS: list[str] = [
+    "RandomForestClassifier",
+    "LogisticRegression",
+    "GradientBoostingClassifier",
+    "ExtraTreesClassifier",
+    "SVC",
+    "KNeighborsClassifier",
+    "GaussianNB",
+    "DecisionTreeClassifier",
+]
+
+PAPER_REGRESSION_MODELS: list[str] = [
+    "RandomForestRegressor",
+    "GradientBoostingRegressor",
+    "ExtraTreesRegressor",
+    "DecisionTreeRegressor",
+    "Ridge",
+    "Lasso",
+    "ElasticNet",
+    "KNeighborsRegressor",
+]
+
+PAPER_CLASSICAL_MODELS: list[str] = PAPER_CLASSIFICATION_MODELS + PAPER_REGRESSION_MODELS
+
 
 @dataclass
 class MLPipelineResult:
@@ -97,6 +121,9 @@ def run_ml_pipeline(config: ExperimentConfig, data_split: DataSplit) -> MLPipeli
 
     valid_params = inspect.signature(cls.__init__).parameters
     hp = {k: v for k, v in config.hyperparameters.items() if k in valid_params}
+    seed = getattr(config, "seed", 42)
+    if "random_state" in valid_params and "random_state" not in hp:
+        hp["random_state"] = seed
 
     t0 = time.perf_counter()
 
@@ -108,7 +135,7 @@ def run_ml_pipeline(config: ExperimentConfig, data_split: DataSplit) -> MLPipeli
             _PARAM_GRIDS[config.model_name],
             n_iter=10,
             cv=3,
-            random_state=42,
+            random_state=seed,
             n_jobs=-1,
             error_score="raise",
         )

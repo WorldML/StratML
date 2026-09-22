@@ -11,6 +11,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import json
+import random
+import uuid
+
 from stratml.execution.schemas import DataProfile, ExperimentResult
 from stratml.core.schemas import ActionDecision, CandidateAction
 
@@ -31,6 +35,7 @@ from stratml.decision.learning import dataset_builder
 from stratml.decision.learning import meta_memory as _meta_memory
 from stratml.decision.state.meta_features import extract as _extract_meta
 from stratml.decision.learning import value_model as _value_model
+import os
 
 
 class DecisionEngine:
@@ -43,6 +48,9 @@ class DecisionEngine:
         time_budget: Optional[float] = None,
         run_id: Optional[str] = None,
         dl_hyperparams: Optional[dict] = None,
+        seed: int = 42,
+        history_mode: str = "independent",
+        llm_mode: Optional[bool] = None,
     ) -> None:
         self.primary_metric    = primary_metric
         self.optimization_goal = optimization_goal
@@ -51,7 +59,16 @@ class DecisionEngine:
         self.max_iterations    = max_iterations
         self.time_budget       = time_budget
         self.dl_hyperparams    = dl_hyperparams or {}
-        self.run_id            = run_id or datetime.now(timezone.utc).strftime("run_%Y%m%d_%H%M%S")
+        self.seed              = seed
+        self._rng              = random.Random(seed)
+        self.history_mode      = history_mode
+
+        if not run_id:
+            now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            salt = uuid.uuid4().hex[:6]
+            self.run_id = f"run_{now_str}_{salt}"
+        else:
+            self.run_id = run_id
 
         self._history               = ExperimentHistory()
         self._profile               = None
@@ -63,6 +80,10 @@ class DecisionEngine:
         self._last_signals = None
         self._last_decision = None
 
+        # Actual best validation model provenance
+        self._best_model: Optional[str] = None
+        self._best_val_score: Optional[float] = None
+
         # Redirect all outputs under outputs/<run_id>/
         self._out_dir = Path("outputs") / self.run_id
         self._out_dir.mkdir(parents=True, exist_ok=True)
@@ -71,9 +92,38 @@ class DecisionEngine:
         counterfactual._CF_LOG        = self._out_dir / "decision_logs" / "counterfactual_log.jsonl"
         dataset_builder._DATASET_PATH = self._out_dir / "decision_logs" / "decision_dataset.csv"
         dataset_builder._UNIFIED_PATH = Path("runs/decision_logs/decision_dataset.csv")
-        # value_model and uncertainty read from unified path so 50-row threshold
-        # counts across all runs, not just the current one
-        _value_model._DATASET_PATH    = Path("runs/decision_logs/decision_dataset.csv")
+
+        # Configure value model history mode and corpus path
+        _value_model._HISTORY_MODE = self.history_mode
+        if self.history_mode == "independent":
+            _value_model._DATASET_PATH = self._out_dir / "decision_logs" / "decision_dataset.csv"
+        else:
+            _value_model._DATASET_PATH = Path("runs/decision_logs/decision_dataset.csv")
+
+        # Record resolved LLM configuration (P0-7)
+        llm_mode_enabled = bool(os.getenv("GROQ_API_KEY")) if llm_mode is None else llm_mode
+        self.llm_config = {
+            "provider": "groq",
+            "model": "llama-3.3-70b-versatile",
+            "llm_mode_enabled": llm_mode_enabled,
+            "temperature": {
+                "action_generator": 0.2,
+                "specialist_agents": 0.0,
+                "coordinator_agent": 0.0,
+                "evaluator_agent": 0.0,
+            },
+            "structured_output_schema": {
+                "action_generator": "_CandidateList",
+                "coordinator": "_CoordinatorOutput",
+                "agents": "_Scores",
+                "evaluator": "_AuditOutput",
+            },
+            "prompt_version": "v1_paper_frozen",
+            "fallback_behavior": "rule_based",
+        }
+        art_dir = self._out_dir / "artifacts"
+        art_dir.mkdir(parents=True, exist_ok=True)
+        (art_dir / "llm_config.json").write_text(json.dumps(self.llm_config, indent=2), encoding="utf-8")
 
     def receive_profile(self, profile: DataProfile) -> ActionDecision:
         self._profile = profile
@@ -117,9 +167,19 @@ class DecisionEngine:
                     if metric_name == "r2"
                     else getattr(result.metrics, "accuracy", 0.0)
                 )
-            current_score = current_score or 0.0
+            current_score = float(current_score or 0.0)
             gain = current_score - self._last_best_score
             backfill_last_gain(gain)
+
+            if self._best_val_score is None:
+                self._best_val_score = current_score
+                self._best_model = result.model_name
+            elif self.optimization_goal == "maximize" and current_score > self._best_val_score:
+                self._best_val_score = current_score
+                self._best_model = result.model_name
+            elif self.optimization_goal == "minimize" and current_score < self._best_val_score:
+                self._best_val_score = current_score
+                self._best_model = result.model_name
 
         if result.model_name not in self._models_tried:
             self._models_tried.append(result.model_name)
@@ -161,7 +221,7 @@ class DecisionEngine:
         stab_scores = stability_agent.score(state, estimates)
 
         ranked   = rank(state, estimates, perf_scores, eff_scores, stab_scores)
-        decision = select(state, ranked)
+        decision = select(state, ranked, rng=self._rng)
 
         # Inject DL hyperparams when running in DL mode
         if self.dl_hyperparams and decision.action_type != "terminate":
@@ -175,6 +235,9 @@ class DecisionEngine:
             state,
             CandidateAction(action_type=decision.action_type, parameters=decision.parameters),
             predicted_gain=predicted_gain,
+            run_id=self.run_id,
+            dataset_id=self._profile.dataset_name if self._profile else None,
+            seed=self.seed,
         )
         decision_logger.log(state, candidates, decision)
         runner_up = ranked[1] if len(ranked) > 1 else None
@@ -191,6 +254,6 @@ class DecisionEngine:
             backfill_last_gain(0.0)
             if self._profile is not None:
                 meta = _extract_meta(self._profile)
-                best_model = state.search.models_tried[-1] if state.search.models_tried else "unknown"
+                best_model = self._best_model or (state.search.models_tried[-1] if state.search.models_tried else "unknown")
                 _meta_memory.record_run(meta, best_model, state.trajectory.best_score, self.run_id)
         return decision
