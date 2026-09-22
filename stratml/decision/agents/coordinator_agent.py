@@ -31,11 +31,14 @@ _W_STAB_DEFAULT = 0.25
 _EMA_ALPHA = 0.2
 
 
-def _load_agent_weights() -> tuple[float, float, float]:
+def _load_agent_weights(log_paths: list[str | Path] | None = None) -> tuple[float, float, float]:
     """Compute per-agent EMA weights from evaluation_log.jsonl across all runs."""
     import glob
     from pathlib import Path
-    logs = glob.glob("outputs/*/decision_logs/evaluation_log.jsonl")
+    if log_paths is not None:
+        logs = [str(p) for p in log_paths]
+    else:
+        logs = glob.glob("outputs/*/decision_logs/evaluation_log.jsonl")
     if not logs:
         return _W_PERF_DEFAULT, _W_EFF_DEFAULT, _W_STAB_DEFAULT
     try:
@@ -91,8 +94,9 @@ def _rule_rank(
     perf_scores: dict[str, float],
     eff_scores: dict[str, float],
     stab_scores: dict[str, float],
+    log_paths: list[str | Path] | None = None,
 ) -> list[RankedAction]:
-    w_p, w_e, w_s = _load_agent_weights()
+    w_p, w_e, w_s = _load_agent_weights(log_paths=log_paths)
     ranked: list[RankedAction] = []
     for e in estimates:
         p  = perf_scores.get(e.action_type, 0.5)
@@ -214,10 +218,11 @@ def rank(
     perf_scores: dict[str, float],
     eff_scores: dict[str, float],
     stab_scores: dict[str, float],
+    log_paths: list[str | Path] | None = None,
 ) -> list[RankedAction]:
     """Return candidates sorted by final_score descending."""
     if os.getenv("GROQ_API_KEY"):
         result = _llm_rank(state, estimates, perf_scores, eff_scores, stab_scores)
         if result is not None:
             return result
-    return _rule_rank(state, estimates, perf_scores, eff_scores, stab_scores)
+    return _rule_rank(state, estimates, perf_scores, eff_scores, stab_scores, log_paths=log_paths)

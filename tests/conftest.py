@@ -14,6 +14,14 @@ from stratml.execution.schemas import (
 )
 
 
+# ── Global offline fixture ───────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def disable_external_apis(monkeypatch):
+    """Ensure test suite runs deterministically and offline without hitting external APIs."""
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+
+
 # ── Reusable PreprocessingConfig ─────────────────────────────────────────────
 
 @pytest.fixture

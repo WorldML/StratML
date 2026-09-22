@@ -4,9 +4,12 @@ test_config_builder.py
 Unit tests for execution/config/experiment_config_builder.py
 """
 
+import inspect
 import pytest
 
+from stratml.decision.actions.action_generator import _DEFAULT_MODELS, _DEFAULT_REGRESSION_MODELS
 from stratml.execution.config.experiment_config_builder import build_experiment_config
+from stratml.execution.pipelines.ml_pipeline import MODEL_REGISTRY
 from stratml.execution.schemas import ActionDecision, PreprocessingConfig
 
 
@@ -134,6 +137,25 @@ class TestCanonicalActionExecution:
                 _action("switch_architecture", {"model_name": "SVC", "new_arch": "CNN1D"})
             )
 
+    @pytest.mark.parametrize("model_name", [
+        "RandomForestClassifier",
+        "LogisticRegression",
+        "SVC",
+        "GradientBoostingRegressor",
+        "DecisionTreeClassifier",
+    ])
+    def test_early_stop_raises_on_classical_models(self, model_name):
+        with pytest.raises(ValueError, match="only supported for deep learning"):
+            build_experiment_config(
+                _action("early_stop", {"model_name": model_name})
+            )
+
+    def test_classical_models_have_early_stopping_false(self):
+        config = build_experiment_config(
+            _action("switch_model", {"model_name": "RandomForestClassifier"})
+        )
+        assert config.early_stopping is False
+
 
 class TestHyperparameterMutationDeterminism:
     @pytest.mark.parametrize("model_name,param,higher_is_more_capacity", [
@@ -165,4 +187,111 @@ class TestHyperparameterMutationDeterminism:
             assert val_inc > val_dec, f"{model_name}: expected val_inc ({val_inc}) > val_dec ({val_dec}) for {param}"
         else:
             assert val_inc < val_dec, f"{model_name}: expected val_inc ({val_inc}) < val_dec ({val_dec}) for {param}"
+
+
+class TestUnsupportedModelsRejectCapacity:
+    def test_unsupported_models_raise_on_capacity_mutations(self):
+        for unsupported in ["LinearRegression", "LinearDiscriminantAnalysis", "UnknownModel"]:
+            with pytest.raises(ValueError, match="does not support capacity mutations"):
+                build_experiment_config(
+                    _action("increase_model_capacity", {"model_name": unsupported})
+                )
+            with pytest.raises(ValueError, match="does not support capacity mutations"):
+                build_experiment_config(
+                    _action("decrease_model_capacity", {"model_name": unsupported})
+                )
+
+
+class TestCanonicalModelSpaceConsistency:
+    def test_all_default_models_in_registry(self):
+        for m in _DEFAULT_MODELS:
+            assert m in MODEL_REGISTRY, f"Default classifier '{m}' is not in MODEL_REGISTRY"
+        for m in _DEFAULT_REGRESSION_MODELS:
+            assert m in MODEL_REGISTRY, f"Default regressor '{m}' is not in MODEL_REGISTRY"
+
+    @pytest.mark.parametrize("model_name", _DEFAULT_MODELS + _DEFAULT_REGRESSION_MODELS)
+    def test_default_models_build_valid_ml_config(self, model_name):
+        cfg = build_experiment_config(_action("switch_model", {"model_name": model_name}))
+        assert cfg.model_name == model_name
+        assert cfg.model_type == "ml"
+        assert cfg.early_stopping is False
+
+    @pytest.mark.parametrize("model_name", _DEFAULT_MODELS + _DEFAULT_REGRESSION_MODELS)
+    def test_classical_model_space_rejects_dl_actions(self, model_name):
+        for dl_act in ["change_optimizer", "unfreeze_backbone", "switch_architecture", "early_stop"]:
+            with pytest.raises(ValueError, match="only supported for deep learning"):
+                build_experiment_config(_action(dl_act, {"model_name": model_name}))
+
+
+class TestStrengthenedMutationToEstimator:
+    @pytest.mark.parametrize("model_name,action_type,param,expected_change_fn", [
+        # Capacity mutations (scale=1.5 for increase, scale=0.75 for decrease)
+        ("RandomForestClassifier", "increase_model_capacity", "n_estimators", lambda b, a: a > b),
+        ("RandomForestClassifier", "decrease_model_capacity", "n_estimators", lambda b, a: a < b),
+        ("GradientBoostingClassifier", "increase_model_capacity", "n_estimators", lambda b, a: a > b),
+        ("GradientBoostingClassifier", "decrease_model_capacity", "n_estimators", lambda b, a: a < b),
+        ("DecisionTreeClassifier", "increase_model_capacity", "max_depth", lambda b, a: a > b),
+        ("DecisionTreeClassifier", "decrease_model_capacity", "max_depth", lambda b, a: a < b),
+        ("LogisticRegression", "increase_model_capacity", "C", lambda b, a: a > b),
+        ("LogisticRegression", "decrease_model_capacity", "C", lambda b, a: a < b),
+        ("SVC", "increase_model_capacity", "C", lambda b, a: a > b),
+        ("SVC", "decrease_model_capacity", "C", lambda b, a: a < b),
+        ("KNeighborsClassifier", "increase_model_capacity", "n_neighbors", lambda b, a: a < b),
+        ("KNeighborsClassifier", "decrease_model_capacity", "n_neighbors", lambda b, a: a > b),
+        ("Ridge", "increase_model_capacity", "alpha", lambda b, a: a < b),
+        ("Ridge", "decrease_model_capacity", "alpha", lambda b, a: a > b),
+        ("Lasso", "increase_model_capacity", "alpha", lambda b, a: a < b),
+        ("Lasso", "decrease_model_capacity", "alpha", lambda b, a: a > b),
+        # Regularization mutations (direction: increase -> stronger regularization)
+        ("LogisticRegression", "modify_regularization", "C", lambda b, a: a < b),
+        ("SVC", "modify_regularization", "C", lambda b, a: a < b),
+        ("Ridge", "modify_regularization", "alpha", lambda b, a: a > b),
+        ("Lasso", "modify_regularization", "alpha", lambda b, a: a > b),
+        ("RandomForestClassifier", "modify_regularization", "max_depth", lambda b, a: a < b),
+        ("GradientBoostingClassifier", "modify_regularization", "max_depth", lambda b, a: a < b),
+        ("DecisionTreeClassifier", "modify_regularization", "max_depth", lambda b, a: a < b),
+        ("KNeighborsClassifier", "modify_regularization", "n_neighbors", lambda b, a: a > b),
+    ])
+    def test_before_action_after_estimator_chain(self, model_name, action_type, param, expected_change_fn):
+        cls = MODEL_REGISTRY[model_name]
+        valid_params = inspect.signature(cls.__init__).parameters
+        assert param in valid_params, f"{param} is not in {cls.__name__}.__init__ signature"
+
+        # 1. Before: baseline config and estimator
+        base_cfg = build_experiment_config(_action("switch_model", {"model_name": model_name}))
+        base_hp = {k: v for k, v in base_cfg.hyperparameters.items() if k in valid_params}
+        if param == "max_depth" and "max_depth" not in base_hp:
+            # scikit-learn tree/forest models default to max_depth=None.
+            # Set explicit baseline depth of 10 so before vs after comparisons are numeric.
+            base_hp["max_depth"] = 10
+        base_est = cls(**base_hp)
+        val_before = getattr(base_est, param)
+
+        # 2. Action: perform hyperparameter mutation
+        params = {"model_name": model_name}
+        if param == "max_depth":
+            params["max_depth"] = val_before
+        if action_type == "increase_model_capacity":
+            params["scale"] = 1.5
+        elif action_type == "decrease_model_capacity":
+            params["scale"] = 0.75
+        elif action_type == "modify_regularization":
+            params["direction"] = "increase"
+        mut_action = _action(action_type, params)
+
+        # 3. After: config builder creates updated ExperimentConfig
+        after_cfg = build_experiment_config(mut_action)
+        val_after_cfg = after_cfg.hyperparameters.get(param)
+        assert val_after_cfg is not None, f"Config missing mutated param '{param}' for {model_name}"
+        assert expected_change_fn(val_before, val_after_cfg), (
+            f"Expected change failed for {model_name}.{param}: before={val_before}, after={val_after_cfg}"
+        )
+
+        # 4. Actual estimator config: instantiate scikit-learn model and assert parameter matches exactly
+        mut_hp = {k: v for k, v in after_cfg.hyperparameters.items() if k in valid_params}
+        estimator = cls(**mut_hp)
+        val_estimator = getattr(estimator, param)
+        assert val_estimator == val_after_cfg, (
+            f"Estimator {cls.__name__}.{param} ({val_estimator}) != config value ({val_after_cfg})"
+        )
 

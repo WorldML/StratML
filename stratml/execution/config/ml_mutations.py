@@ -89,9 +89,17 @@ def increase_capacity(model_name_or_hp: str | dict, hp: dict | None = None, scal
     elif model_name.startswith("AdaBoost"):
         n = hp_out.get("n_estimators", 50)
         hp_out["n_estimators"] = int(n * scale)
+    elif model_name.startswith(("Ridge", "Lasso", "ElasticNet")):
+        alpha = hp_out.get("alpha", 1.0)
+        hp_out["alpha"] = round(max(0.0001, float(alpha) / scale), 6)
+    elif model_name.startswith("GaussianNB"):
+        v = hp_out.get("var_smoothing", 1e-9)
+        hp_out["var_smoothing"] = round(max(1e-12, float(v) / scale), 12)
+    elif model_name.startswith("SGD"):
+        alpha = hp_out.get("alpha", 0.0001)
+        hp_out["alpha"] = round(max(1e-7, float(alpha) / scale), 7)
     else:
-        n = hp_out.get("n_estimators", 100)
-        hp_out["n_estimators"] = int(n * scale)
+        raise ValueError(f"Model '{model_name}' does not support capacity mutations")
 
     return hp_out
 
@@ -128,8 +136,16 @@ def decrease_capacity(model_name_or_hp: str | dict, hp: dict | None = None, scal
     elif model_name.startswith("AdaBoost"):
         n = hp_out.get("n_estimators", 50)
         hp_out["n_estimators"] = max(10, int(n * scale))
+    elif model_name.startswith(("Ridge", "Lasso", "ElasticNet")):
+        alpha = hp_out.get("alpha", 1.0)
+        hp_out["alpha"] = round(float(alpha) / scale, 6)
+    elif model_name.startswith("GaussianNB"):
+        v = hp_out.get("var_smoothing", 1e-9)
+        hp_out["var_smoothing"] = round(float(v) / scale, 12)
+    elif model_name.startswith("SGD"):
+        alpha = hp_out.get("alpha", 0.0001)
+        hp_out["alpha"] = round(float(alpha) / scale, 7)
     else:
-        n = hp_out.get("n_estimators", 100)
-        hp_out["n_estimators"] = max(10, int(n * scale))
+        raise ValueError(f"Model '{model_name}' does not support capacity mutations")
 
     return hp_out

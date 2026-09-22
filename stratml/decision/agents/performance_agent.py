@@ -42,12 +42,12 @@ _FITTING_PRIORITY: dict[str, dict[str, float]] = {
         "terminate": 0.20,
     },
     "well_fitted": {
-        "switch_model": 0.30,
-        "increase_model_capacity": 0.20,
-        "modify_regularization": 0.20,
-        "decrease_model_capacity": 0.20,
-        "change_optimizer": 0.20,
-        "terminate": 0.90,
+        "switch_model": 0.80,
+        "increase_model_capacity": 0.60,
+        "modify_regularization": 0.50,
+        "decrease_model_capacity": 0.30,
+        "change_optimizer": 0.40,
+        "terminate": 0.10,
     },
     "default": {
         "switch_model": 0.60,

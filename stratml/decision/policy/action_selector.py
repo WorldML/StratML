@@ -79,12 +79,18 @@ def _build_preprocessing(state: StateObject, action_type: str = "", parameters: 
 
 def select(state: StateObject, ranked: list[RankedAction]) -> ActionDecision:
     """Pick an action using epsilon-greedy exploration, then return an ActionDecision."""
-    epsilon = _EPSILON_LOW_DATA if _row_count() < _MIN_ROWS else _EPSILON_HIGH_DATA
-    non_terminate = [r for r in ranked if r.action_type != "terminate"]
-    if non_terminate and random.random() < epsilon:
-        best = random.choice(non_terminate)
+    if state.resources.budget_exhausted:
+        best = next((r for r in ranked if r.action_type == "terminate"), ranked[0])
     else:
-        best = ranked[0]
+        epsilon = _EPSILON_LOW_DATA if _row_count() < _MIN_ROWS else _EPSILON_HIGH_DATA
+        non_terminate = [r for r in ranked if r.action_type != "terminate"]
+        if non_terminate:
+            if random.random() < epsilon:
+                best = random.choice(non_terminate)
+            else:
+                best = non_terminate[0]
+        else:
+            best = ranked[0]
 
     trigger = _infer_trigger(state)
     evidence = _build_evidence(state)

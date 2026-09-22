@@ -83,6 +83,8 @@ _DL_TOO_SLOW_FALLBACK = {
 
 def generate(state: StateObject) -> list[CandidateAction]:
     """Return candidate actions for the current state."""
+    if state.resources.budget_exhausted:
+        return [CandidateAction(action_type="terminate", parameters={})]
     if state.meta.iteration == 0:
         return _bootstrap_candidates(state)
     if os.getenv("GROQ_API_KEY"):
@@ -161,10 +163,13 @@ def _llm_candidates(state: StateObject) -> Optional[list[CandidateAction]]:
         llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.2).with_structured_output(_CandidateList)
         output: _CandidateList = llm.invoke([SystemMessage(_SYSTEM_PROMPT), HumanMessage(human)])
 
+        _dl_only = {"early_stop", "change_optimizer", "unfreeze_backbone", "switch_architecture"}
+        is_dl = getattr(state.model, "model_type", "ml") == "dl"
         candidates = [
             CandidateAction(action_type=item.action_type, parameters=item.parameters)
             for item in output.candidates
             if item.action_type in _VALID_ACTION_TYPES
+            and (is_dl or item.action_type not in _dl_only)
         ]
 
         if not candidates:
@@ -209,7 +214,7 @@ def _rule_candidates(state: StateObject) -> list[CandidateAction]:
     if state.resources.budget_exhausted:
         return [CandidateAction(action_type="terminate", parameters={})]
 
-    if sig.converged != "none" and sig.well_fitted != "none":
+    if not untried and state.meta.iteration > 1 and sig.converged != "none" and sig.well_fitted != "none":
         return [CandidateAction(action_type="terminate", parameters={})]
 
     if sig.underfitting != "none":
@@ -282,7 +287,7 @@ def _rule_candidates_dl(state: StateObject, modality: str) -> list[CandidateActi
     if state.resources.budget_exhausted:
         return [CandidateAction(action_type="terminate", parameters={})]
 
-    if sig.converged != "none" and sig.well_fitted != "none":
+    if not untried and state.meta.iteration > 1 and sig.converged != "none" and sig.well_fitted != "none":
         return [CandidateAction(action_type="terminate", parameters={})]
 
     # too_slow: drop to the lightweight pretrained model for this modality

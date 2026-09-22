@@ -207,9 +207,19 @@ class TestFeatureSelection:
         split = _make_split(X, y)
         profile = _profile(["f0", "const"], [])
 
-        clean, _ = apply_preprocessing(split, _prep(feature_selection="variance_threshold"), profile)
-        assert "const" not in clean.X_val.columns
-        assert "const" not in clean.X_test.columns
+        # Holdout contract: experimentation loop (transform_test=False) does not touch X_test
+        clean_loop, _ = apply_preprocessing(
+            split, _prep(feature_selection="variance_threshold"), profile, transform_test=False
+        )
+        assert "const" not in clean_loop.X_val.columns
+        assert "const" in clean_loop.X_test.columns
+
+        # Final evaluation call (transform_test=True) transforms X_test
+        clean_final, _ = apply_preprocessing(
+            split, _prep(feature_selection="variance_threshold"), profile, transform_test=True
+        )
+        assert "const" not in clean_final.X_val.columns
+        assert "const" not in clean_final.X_test.columns
 
 
 # ── Return value ──────────────────────────────────────────────────────────────

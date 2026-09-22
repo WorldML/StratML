@@ -92,14 +92,20 @@ def build_experiment_config(action: ActionDecision, tune: bool = False) -> Exper
                 prep_dict[k] = params[k]
         preprocessing = PreprocessingConfig(**prep_dict)
 
-    elif action_type in ("early_stop", "terminate"):
+    elif action_type == "early_stop":
+        if not is_dl:
+            raise ValueError(
+                f"Action 'early_stop' is only supported for deep learning models, but model is classical: '{model_name}'"
+            )
+
+    elif action_type == "terminate":
         pass
 
     else:
         raise ValueError(f"Unknown action_type: '{action_type}'")
 
     model_type = "dl" if is_dl else "ml"
-    early_stopping = True if is_dl else (action_type == "early_stop")
+    early_stopping = True if is_dl else False
     patience = int(params.get("early_stopping_patience", 5))
 
     return ExperimentConfig(
