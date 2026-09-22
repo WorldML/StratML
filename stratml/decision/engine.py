@@ -81,6 +81,8 @@ class DecisionEngine:
         self._repeated_configs: int   = 0
         self._last_action: Optional[str]   = None
         self._last_action_success: Optional[bool] = None
+        self._last_execution_status: Optional[str] = None
+        self._last_action_outcome: Optional[str] = None
         self._last_best_score: Optional[float]    = None  # for observed_gain backfill
         self._dataset_fingerprint: Optional[str]  = None
         self._last_signals = None
@@ -197,22 +199,45 @@ class DecisionEngine:
             )
         current_score = float(current_score or 0.0)
 
-        # Determine action success/failure for S_(t+1) (P0-27)
+        # Determine action success/failure and separate execution status from action outcome (P0-27 & P1-27)
         is_failed = getattr(result, "failed", False) or getattr(result, "status", "") == "failed"
         if is_failed:
+            execution_status = "failed"
+            action_outcome = "failure"
             action_success = False
             gain = (current_score - self._last_best_score) if self._last_best_score is not None else 0.0
         elif self._last_best_score is not None:
+            execution_status = "completed"
             gain = current_score - self._last_best_score
             if self.optimization_goal == "minimize":
-                action_success = (gain <= 0.0)
+                if gain < 0.0:
+                    action_outcome = "improvement"
+                    action_success = True
+                elif gain > 0.0:
+                    action_outcome = "degradation"
+                    action_success = False
+                else:
+                    action_outcome = "neutral"
+                    action_success = True
             else:
-                action_success = (gain >= 0.0)
+                if gain > 0.0:
+                    action_outcome = "improvement"
+                    action_success = True
+                elif gain < 0.0:
+                    action_outcome = "degradation"
+                    action_success = False
+                else:
+                    action_outcome = "neutral"
+                    action_success = True
         else:
+            execution_status = "completed"
+            action_outcome = "neutral"
             gain = 0.0
             action_success = True
 
         self._last_action_success = action_success
+        self._last_execution_status = execution_status
+        self._last_action_outcome = action_outcome
 
         if self._last_action is not None and self._last_decision is not None:
             backfill_last_gain(
@@ -255,13 +280,15 @@ class DecisionEngine:
             repeated_configs=self._repeated_configs,
             remaining_budget=remaining,
             previous_signals=self._last_signals,
+            execution_status=self._last_execution_status,
+            action_outcome=self._last_action_outcome,
         )
         if self._last_decision is not None:
             eval_log = self._out_dir / "decision_logs" / "evaluation_log.jsonl"
             evaluator_agent._EVAL_LOG = eval_log
             eval_record = evaluator_agent.audit(self._last_decision, result, state)
 
-            # Reconstructable trajectory (P0-25): Link execution result and evaluator result to previous decision record
+            # Reconstructable trajectory (P0-25 & P1-25): Link execution result and evaluator result to previous decision record
             next_state_id = f"{result.experiment_id}_{result.iteration}"
             exec_summary = {
                 "experiment_id": result.experiment_id,
@@ -270,6 +297,8 @@ class DecisionEngine:
                 "metrics": result.metrics.model_dump(),
                 "runtime": result.runtime,
                 "action_success": self._last_action_success,
+                "execution_status": self._last_execution_status,
+                "action_outcome": self._last_action_outcome,
                 "gain": gain,
             }
             eval_summary = {
@@ -362,6 +391,7 @@ class DecisionEngine:
         # Coordinator weights used for this decision (P0-23)
         coordinator_weights = coordinator_agent.get_current_weights()
         coordinator_weights["iteration"] = state.meta.iteration
+        coordinator_learning_state = coordinator_agent.get_learning_state()
 
         # Ranked candidates information for runner-up traceability (P0-26)
         ranked_candidates = [
@@ -391,6 +421,7 @@ class DecisionEngine:
             candidates,
             decision,
             coordinator_weights=coordinator_weights,
+            coordinator_learning_state=coordinator_learning_state,
             ranked_candidates=ranked_candidates,
         )
 

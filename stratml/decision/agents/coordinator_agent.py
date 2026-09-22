@@ -18,7 +18,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel
 
@@ -40,11 +40,24 @@ _CURRENT_WEIGHTS: dict[str, float] = {
 }
 
 _WEIGHT_UPDATE_HISTORY: list[dict] = []
+_WEIGHT_LEARNING_THRESHOLD = 5
+
+_LEARNING_STATE: dict[str, Any] = {
+    "weight_learning_enabled": True,
+    "weight_learning_active": False,
+    "weight_learning_observation_count": 0,
+    "weight_learning_threshold": _WEIGHT_LEARNING_THRESHOLD,
+}
 
 
 def get_current_weights() -> dict[str, float]:
     """Return the coordinator weights used for the latest ranking."""
     return dict(_CURRENT_WEIGHTS)
+
+
+def get_learning_state() -> dict[str, Any]:
+    """Return the observable activation state of adaptive coordinator weight learning."""
+    return dict(_LEARNING_STATE)
 
 
 def get_persisted_weight_updates(path: str | Path) -> list[dict]:
@@ -70,12 +83,18 @@ def get_weight_update_history(log_path: str | Path | None = None) -> list[dict]:
 
 def reset_weight_update_history() -> None:
     """Reset coordinator weight update history to defaults."""
-    global _WEIGHT_UPDATE_HISTORY, _CURRENT_WEIGHTS
+    global _WEIGHT_UPDATE_HISTORY, _CURRENT_WEIGHTS, _LEARNING_STATE
     _WEIGHT_UPDATE_HISTORY = []
     _CURRENT_WEIGHTS = {
         "performance_weight": _W_PERF_DEFAULT,
         "efficiency_weight": _W_EFF_DEFAULT,
         "stability_weight": _W_STAB_DEFAULT,
+    }
+    _LEARNING_STATE = {
+        "weight_learning_enabled": True,
+        "weight_learning_active": False,
+        "weight_learning_observation_count": 0,
+        "weight_learning_threshold": _WEIGHT_LEARNING_THRESHOLD,
     }
 
 
@@ -134,10 +153,17 @@ def _load_agent_weights(
                         rec["_line_index"] = idx
                         records.append(rec)
 
-        if len(records) < 5:
+        _LEARNING_STATE["weight_learning_observation_count"] = len(records)
+        _LEARNING_STATE["weight_learning_threshold"] = _WEIGHT_LEARNING_THRESHOLD
+        _LEARNING_STATE["weight_learning_enabled"] = True
+
+        if len(records) < _WEIGHT_LEARNING_THRESHOLD:
+            _LEARNING_STATE["weight_learning_active"] = False
             weights = (_W_PERF_DEFAULT, _W_EFF_DEFAULT, _W_STAB_DEFAULT)
             _set_current_weights(*weights)
             return weights
+
+        _LEARNING_STATE["weight_learning_active"] = True
 
         # Deterministic EMA weight updates with bounded values and attributable history
         w_p = w_e = w_s = 0.5
@@ -285,6 +311,7 @@ class RankedAction:
     final_score: float
     rationale: str = field(default="")
     source: Optional[str] = field(default=None)
+    fallback_participation: bool = field(default=False)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +334,7 @@ def _rule_rank(
     else:
         w_p, w_e, w_s = _load_agent_weights()
     ranked: list[RankedAction] = []
+    is_fallback = (source == "fallback")
     for e in estimates:
         p  = perf_scores.get(e.action_type, 0.5)
         ef = eff_scores.get(e.action_type, 0.5)
@@ -321,6 +349,7 @@ def _rule_rank(
             agent_scores=AgentScore(performance=p, efficiency=ef, stability=st),
             final_score=final,
             source=source,
+            fallback_participation=is_fallback,
         ))
     ranked.sort(key=lambda r: r.final_score, reverse=True)
     return ranked
@@ -398,8 +427,16 @@ def _llm_rank(
             ef = eff_scores.get(e.action_type, 0.5)
             st = stab_scores.get(e.action_type, 0.5)
             llm_item = llm_map.get(e.action_type)
-            final = round(max(0.0, min(llm_item.final_score, 1.0)), 4) if llm_item else round(_W_PERF_DEFAULT * p + _W_EFF_DEFAULT * ef + _W_STAB_DEFAULT * st, 4)
-            rationale = llm_item.rationale if llm_item else ""
+            if llm_item is not None:
+                final = round(max(0.0, min(llm_item.final_score, 1.0)), 4)
+                rationale = llm_item.rationale
+                item_source = "llm"
+                fallback_part = False
+            else:
+                final = round(_W_PERF_DEFAULT * p + _W_EFF_DEFAULT * ef + _W_STAB_DEFAULT * st, 4)
+                rationale = "Fallback rule score (missing from LLM output)"
+                item_source = "fallback"
+                fallback_part = True
             ranked.append(RankedAction(
                 action_type=e.action_type,
                 parameters=e.parameters,
@@ -409,7 +446,8 @@ def _llm_rank(
                 agent_scores=AgentScore(performance=p, efficiency=ef, stability=st),
                 final_score=final,
                 rationale=rationale,
-                source="llm",
+                source=item_source,
+                fallback_participation=fallback_part,
             ))
 
         ranked.sort(key=lambda r: r.final_score, reverse=True)

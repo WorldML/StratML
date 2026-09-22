@@ -27,13 +27,13 @@ def _load_calibration_pairs(csv_path: Path):
         import pandas as pd
 
         df = pd.read_csv(csv_path)
-        df = df[df["observed_gain"].notna() & (df["observed_gain"] != "")]
+        df["pred_num"] = pd.to_numeric(df["predicted_gain"], errors="coerce")
+        df["obs_num"] = pd.to_numeric(df["observed_gain"], errors="coerce")
+        df = df.dropna(subset=["pred_num", "obs_num"])
         if len(df) < _MIN_ROWS:
             return None, None
-
-        df = df[df["predicted_gain"].notna()]
-        y_pred = df["predicted_gain"].astype(float).values
-        y_true = df["observed_gain"].astype(float).values
+        y_pred = df["pred_num"].values
+        y_true = df["obs_num"].values
         return y_pred, y_true
     except Exception as exc:
         log.warning("calibration: failed to load pairs (%s)", exc)

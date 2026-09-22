@@ -90,6 +90,7 @@ def select(
     if state.resources.budget_exhausted:
         best = next((r for r in ranked if r.action_type == "terminate"), ranked[0])
         effective_source = "rule"
+        selection_mode = "greedy"
     else:
         epsilon = _EPSILON_LOW_DATA if _row_count() < _MIN_ROWS else _EPSILON_HIGH_DATA
         non_terminate = [r for r in ranked if r.action_type != "terminate"]
@@ -99,9 +100,11 @@ def select(
         if top_source == "llm" or decision_source == "llm":
             best = candidates_pool[0]
             effective_source = "llm"
+            selection_mode = "greedy"
         elif local_rng.random() < epsilon:
             best = local_rng.choice(candidates_pool)
             effective_source = decision_source or getattr(best, "source", None) or "rule"
+            selection_mode = "epsilon_exploration"
         else:
             best = candidates_pool[0]
             candidate_source = getattr(best, "source", None)
@@ -113,9 +116,13 @@ def select(
                 effective_source = "learned"
             else:
                 effective_source = "rule"
+            selection_mode = "greedy"
 
         if state.meta.iteration == 0:
             effective_source = "bootstrap"
+            selection_mode = "bootstrap"
+
+    fallback_part = getattr(best, "fallback_participation", False) or (effective_source == "fallback")
 
     trigger = _infer_trigger(state)
     evidence = _build_evidence(state)
@@ -137,6 +144,8 @@ def select(
             trigger=trigger,
             evidence=evidence,
             source=effective_source,
+            selection_mode=selection_mode,
+            fallback_participation=bool(fallback_part),
         ),
     )
 

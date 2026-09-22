@@ -50,6 +50,35 @@ def apply_cli_overrides(config, args):
         config["execution"]["max_iterations"] = args.max_iter
     if getattr(args, "path", None) is not None:
         config["dataset"]["path"] = args.path
+
+    # P1-21: Ablation controls via CLI flags
+    abl = config.setdefault("ablations", {"enable_meta_memory": True, "enable_value_model": True, "condition": "full"})
+    if getattr(args, "disable_meta_memory", False):
+        abl["enable_meta_memory"] = False
+    if getattr(args, "disable_value_model", False):
+        abl["enable_value_model"] = False
+    ablation_arg = getattr(args, "ablation", None)
+    if ablation_arg is not None:
+        ab_clean = str(ablation_arg).strip().lower()
+        if ab_clean in ("metamemory off", "metamemory_off", "no_metamemory", "disable_metamemory"):
+            abl["enable_meta_memory"] = False
+        elif ab_clean in ("value model off", "value_model_off", "no_value_model", "disable_value_model"):
+            abl["enable_value_model"] = False
+        elif ab_clean in ("full", "none"):
+            abl["enable_meta_memory"] = True
+            abl["enable_value_model"] = True
+
+    mm = abl.get("enable_meta_memory", True)
+    vm = abl.get("enable_value_model", True)
+    if mm and vm:
+        abl["condition"] = "full"
+    elif not mm and vm:
+        abl["condition"] = "MetaMemory OFF"
+    elif mm and not vm:
+        abl["condition"] = "Value Model OFF"
+    else:
+        abl["condition"] = "MetaMemory OFF, Value Model OFF"
+
     return config
 
 
@@ -324,6 +353,9 @@ def main():
     run.add_argument("--epochs", type=int)
     run.add_argument("--lr", type=float)
     run.add_argument("--batch-size", type=int)
+    run.add_argument("--disable-meta-memory", action="store_true", help="Disable MetaMemory retrieval")
+    run.add_argument("--disable-value-model", action="store_true", help="Disable Value Model predictions")
+    run.add_argument("--ablation", type=str, help="Ablation condition: full | MetaMemory OFF | Value Model OFF")
 
     # ── validate-config ───────────────────────────────────────────────────────
     vc = sub.add_parser("validate-config", help="Validate a config file")

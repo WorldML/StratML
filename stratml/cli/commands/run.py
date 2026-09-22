@@ -108,6 +108,10 @@ def run_pipeline(args) -> None:
     run_id       = f"{dataset_name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     out_dir      = Path("outputs") / run_id
 
+    abl_cfg = config.get("ablations", {})
+    enable_meta_memory = abl_cfg.get("enable_meta_memory", True)
+    enable_value_model = abl_cfg.get("enable_value_model", True)
+
     engine = DecisionEngine(
         max_iterations=e["max_iterations"],
         time_budget=e.get("timeout_per_run"),
@@ -116,6 +120,8 @@ def run_pipeline(args) -> None:
         dl_hyperparams=dl_hyperparams,
         seed=seed,
         llm_mode=config.get("llm_mode", e.get("llm_mode")),
+        enable_meta_memory=enable_meta_memory,
+        enable_value_model=enable_value_model,
     )
 
     orchestrator = ExecutionOrchestrator(
@@ -131,6 +137,7 @@ def run_pipeline(args) -> None:
         log=_console.print,
         tune=config.get("execution", {}).get("tune", False),
         max_iterations=e.get("max_iterations", 5),
+        resolved_config=config,
     )
     orchestrator.run(d["path"], d["target_column"])
 

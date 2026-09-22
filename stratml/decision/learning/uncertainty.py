@@ -34,7 +34,7 @@ class UncertaintyEstimate:
     predicted_gain: float
     predicted_cost: float
     confidence: float
-    variance: float
+    variance: float = 0.0
 
 
 def estimate(predictions: list[ValuePrediction], state: "StateObject | None" = None) -> list[UncertaintyEstimate]:

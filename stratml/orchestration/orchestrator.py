@@ -55,6 +55,7 @@ class ExecutionOrchestrator:
         enable_mlflow: bool = False,
         tune: bool = False,
         max_iterations: int | None = None,
+        resolved_config: Optional[dict] = None,
     ) -> None:
         self.send_profile  = send_profile
         self.send_result   = send_result
@@ -65,6 +66,7 @@ class ExecutionOrchestrator:
         self.enable_mlflow = enable_mlflow
         self.tune          = tune
         self.max_iterations = max_iterations if max_iterations is not None else 5
+        self.resolved_config = resolved_config
         self.decision_iterations = 0
         self.actual_fits = 0
         self.actual_evaluations = 0
@@ -386,6 +388,8 @@ class ExecutionOrchestrator:
             }
 
         import subprocess
+        import hashlib
+
         try:
             commit_hash = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"],
@@ -394,6 +398,70 @@ class ExecutionOrchestrator:
             ).decode().strip()
         except Exception:
             commit_hash = "unknown"
+
+        # Resolved ablations and condition (P1-21)
+        enable_mm = getattr(engine, "enable_meta_memory", True)
+        enable_vm = getattr(engine, "enable_value_model", True)
+        if self.resolved_config and "ablations" in self.resolved_config:
+            enable_mm = self.resolved_config["ablations"].get("enable_meta_memory", enable_mm)
+            enable_vm = self.resolved_config["ablations"].get("enable_value_model", enable_vm)
+
+        if enable_mm and enable_vm:
+            condition = "full"
+        elif not enable_mm and enable_vm:
+            condition = "MetaMemory OFF"
+        elif enable_mm and not enable_vm:
+            condition = "Value Model OFF"
+        else:
+            condition = "MetaMemory OFF, Value Model OFF"
+
+        # Warm start paths and snapshot hashes (P1-28 + P1-30)
+        history_mode = getattr(engine, "history_mode", "independent")
+        if history_mode == "independent":
+            corpus_path = Path("outputs") / self.run_id / "decision_logs" / "decision_dataset.csv"
+            meta_memory_path = Path("outputs") / self.run_id / "decision_logs" / "meta_memory.jsonl"
+        else:
+            corpus_path = Path("runs/decision_logs/decision_dataset.csv")
+            meta_memory_path = Path("runs/decision_logs/meta_memory.jsonl")
+
+        def _compute_hash(p: Path) -> Optional[str]:
+            if not p.exists() or p.stat().st_size == 0:
+                return None
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                while chunk := f.read(65536):
+                    h.update(chunk)
+            return h.hexdigest()
+
+        corpus_snapshot_hash = _compute_hash(corpus_path)
+        meta_memory_snapshot_hash = _compute_hash(meta_memory_path)
+
+        resolved_exp_config = {
+            "seed": self.split_config.random_seed,
+            "budget": {
+                "max_iterations": self.max_iterations,
+                "timeout_per_run_seconds": self.time_budget,
+                "tune": self.tune,
+            },
+            "ablations": {
+                "enable_meta_memory": enable_mm,
+                "enable_value_model": enable_vm,
+                "condition": condition,
+            },
+            "llm_configuration": llm_cfg,
+            "split_config": {
+                "method": self.split_config.method,
+                "test_size": self.split_config.test_size,
+                "val_size": self.split_config.val_size,
+                "random_seed": self.split_config.random_seed,
+            },
+        }
+        if self.resolved_config:
+            resolved_exp_config["mode"] = self.resolved_config.get("mode", "beginner")
+            if "deep_learning" in self.resolved_config:
+                resolved_exp_config["deep_learning"] = self.resolved_config["deep_learning"]
+
+        config_hash = hashlib.sha256(json.dumps(resolved_exp_config, sort_keys=True).encode("utf-8")).hexdigest()
 
         manifest = {
             "manifest_version": "1.0",
@@ -415,12 +483,19 @@ class ExecutionOrchestrator:
             "action_space": sorted(list(PAPER_CLASSICAL_ACTIONS)),
             "hyperparameter_mutation_space": get_paper_mutation_space(),
             "llm_configuration": llm_cfg,
+            "resolved_experiment_config": resolved_exp_config,
+            "config_hash": config_hash,
+            "condition": condition,
             "warm_start_mode_corpus": {
-                "history_mode": getattr(engine, "history_mode", "independent"),
-                "corpus_path": str(Path("runs/decision_logs/decision_dataset.csv")),
-                "meta_memory_path": str(Path("runs/decision_logs/meta_memory.jsonl")),
-                "enable_meta_memory": getattr(engine, "enable_meta_memory", True),
-                "enable_value_model": getattr(engine, "enable_value_model", True),
+                "history_mode": history_mode,
+                "corpus_path": str(corpus_path),
+                "corpus_snapshot_hash": corpus_snapshot_hash,
+                "meta_memory_path": str(meta_memory_path),
+                "meta_memory_snapshot_hash": meta_memory_snapshot_hash,
+                "enable_meta_memory": enable_mm,
+                "enable_value_model": enable_vm,
+                "condition": condition,
+                "dataset_fingerprint": getattr(profile, "dataset_fingerprint", None),
             },
             "stratml_version": {
                 "version": "0.1.0",

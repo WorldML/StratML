@@ -24,7 +24,7 @@ Cross-team boundary rule
 
 from __future__ import annotations
 
-from typing import Annotated, Optional, Union
+from typing import Annotated, Any, Optional, Union
 from pydantic import BaseModel, BeforeValidator, Field
 
 
@@ -35,11 +35,11 @@ from pydantic import BaseModel, BeforeValidator, Field
 class PreprocessingConfig(BaseModel):
     """Preprocessing decisions — embedded in both ActionDecision and ExperimentResult."""
 
-    missing_value_strategy: str = Field(..., pattern="^(mean|median|mode|drop)$")
-    scaling: str = Field(..., pattern="^(standard|minmax|robust|none)$")
-    encoding: str = Field(..., pattern="^(onehot|label|none)$")
-    imbalance_strategy: str = Field(..., pattern="^(oversample|undersample|none)$")
-    feature_selection: str = Field(..., pattern="^(variance_threshold|none)$")
+    missing_value_strategy: str = Field(default="mean", pattern="^(mean|median|mode|drop)$")
+    scaling: str = Field(default="standard", pattern="^(standard|minmax|robust|none)$")
+    encoding: str = Field(default="onehot", pattern="^(onehot|label|none)$")
+    imbalance_strategy: str = Field(default="none", pattern="^(oversample|undersample|none)$")
+    feature_selection: str = Field(default="none", pattern="^(variance_threshold|none)$")
 
 
 class ExperimentMetrics(BaseModel):
@@ -63,9 +63,9 @@ class ResourceUsage(BaseModel):
 
 
 class ArtifactRefs(BaseModel):
-    model_path: str
-    metrics_file: str
-    tensorboard_logs: str
+    model_path: str = ""
+    metrics_file: str = ""
+    tensorboard_logs: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +81,7 @@ class ExperimentResult(BaseModel):
     # --- identification ---
     experiment_id: str
     iteration: int
-    dataset_name: str
+    dataset_name: str = "dataset"
 
     # --- model ---
     model_name: str
@@ -123,11 +123,19 @@ class DecisionReason(BaseModel):
     trigger: str
     evidence: dict = Field(default_factory=dict)
     source: str = Field(default="rule", pattern="^(bootstrap|rule|llm|value_model|hybrid|fallback|learned)$")
+    selection_mode: Optional[str] = Field(default="greedy", pattern="^(greedy|epsilon_exploration|bootstrap|fallback)$")
+    fallback_participation: Optional[bool] = False
 
 
 def _coerce_reason(v):
     if isinstance(v, str):
-        return {"trigger": v, "evidence": {}, "source": "rule"}
+        return {
+            "trigger": v,
+            "evidence": {},
+            "source": "rule",
+            "selection_mode": "greedy",
+            "fallback_participation": False,
+        }
     return v
 
 
@@ -245,7 +253,7 @@ class StateGeneralization(BaseModel):
 
 class StateResources(BaseModel):
     runtime: float
-    gpu_used: bool
+    gpu_used: bool = False
     cpu_time: float
     remaining_budget: Optional[float] = None
     budget_exhausted: bool = False
@@ -300,6 +308,8 @@ class StateActionContext(BaseModel):
     previous_action_success: Optional[bool] = None
     action_effect_magnitude: Optional[float] = None
     previous_signals: Optional["StateSignals"] = None
+    execution_status: Optional[str] = "completed"
+    action_outcome: Optional[str] = None
 
 
 class StateConstraints(BaseModel):
@@ -355,8 +365,15 @@ class DecisionRecord(BaseModel):
     state_snapshot: StateObject
     candidate_actions: list[CandidateAction]
     selected_action: ActionDecision
-    coordinator_weights: Optional[dict[str, float]] = None
+    coordinator_weights: Optional[dict[str, Any]] = None
+    coordinator_learning_state: Optional[dict[str, Any]] = None
+    selection_mode: Optional[str] = "greedy"
+    fallback_participation: Optional[bool] = False
     ranked_candidates: Optional[list[dict]] = None
     execution_result: Optional[dict] = None
     evaluator_result: Optional[dict] = None
     next_state_id: Optional[str] = None
+
+
+DecisionRecord.model_rebuild()
+StateObject.model_rebuild()
