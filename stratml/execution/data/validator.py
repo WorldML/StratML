@@ -4,11 +4,13 @@ validator.py
 Phase 1 — Dataset Ingestion: validate the loaded DataFrame and build a Dataset object.
 """
 
+from typing import Optional
 import hashlib
 import warnings
 
 import pandas as pd
 from stratml.execution.schemas import Dataset
+
 
 
 def compute_dataset_fingerprint(df: pd.DataFrame) -> str:
@@ -29,10 +31,34 @@ def compute_dataset_fingerprint(df: pd.DataFrame) -> str:
     return hasher.hexdigest()[:16]
 
 
+BENCHMARK_TARGETS: dict[str, str] = {
+    "adult": "class",
+    "australian": "A15",
+    "bank-marketing": "Class",
+    "blood-transfusion": "Class",
+    "credit-g": "class",
+    "jannis": "class",
+    "jasmine": "class",
+    "kc1": "defects",
+    "phoneme": "Class",
+    "vehicle": "Class",
+    "abalone": "Class_number_of_rings",
+    "boston": "MEDV",
+    "brazilian": "total_(BRL)",
+    "elevators": "Goal",
+    "house_16H": "price",
+    "moneyball": "RS",
+    "online-news": "shares",
+    "pol": "foo",
+    "wine_quality": "quality",
+    "yprop_4_1": "oz252",
+}
+
+
 def build_dataset(
     df: pd.DataFrame,
     dataset_name: str,
-    target_column: str,
+    target_column: Optional[str] = None,
 ) -> Dataset:
     """
     Validate the DataFrame and construct a Dataset object.
@@ -51,12 +77,32 @@ def build_dataset(
     if dupes:
         raise ValueError(f"Duplicate column names detected: {sorted(dupes)}")
 
-    # 3. Target column exists
+    # 3. Resolve target column if None or not found
+    if target_column is None or target_column == "":
+        name_key = dataset_name.lower().replace("_", "-")
+        if name_key in BENCHMARK_TARGETS and BENCHMARK_TARGETS[name_key] in df.columns:
+            target_column = BENCHMARK_TARGETS[name_key]
+        elif dataset_name in BENCHMARK_TARGETS and BENCHMARK_TARGETS[dataset_name] in df.columns:
+            target_column = BENCHMARK_TARGETS[dataset_name]
+        else:
+            for cand in ["class", "Class", "target", "Target", "label", "Label"]:
+                if cand in df.columns:
+                    target_column = cand
+                    break
+            if target_column is None:
+                target_column = df.columns[-1]
+
     if target_column not in df.columns:
-        raise ValueError(
-            f"Target column '{target_column}' not found. "
-            f"Available columns: {list(df.columns)}"
-        )
+        # Check case-insensitive match
+        col_map = {c.lower(): c for c in df.columns}
+        if target_column.lower() in col_map:
+            target_column = col_map[target_column.lower()]
+        else:
+            raise ValueError(
+                f"Target column '{target_column}' not found. "
+                f"Available columns: {list(df.columns)}"
+            )
+
 
     # 4. All-null columns — warn and drop
     all_null = [c for c in df.columns if df[c].isnull().all()]

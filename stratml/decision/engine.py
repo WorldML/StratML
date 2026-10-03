@@ -236,12 +236,11 @@ class DecisionEngine:
         self._profile = profile
         self._dataset_fingerprint = getattr(profile, "dataset_fingerprint", None)
         if not self._metric_explicit or self.primary_metric is None:
-            if profile.problem_type == "regression":
-                self.primary_metric = "r2"
-                self.optimization_goal = "maximize"
-            else:
-                self.primary_metric = "accuracy"
-                self.optimization_goal = "maximize"
+            from stratml.core.metrics import resolve_canonical_metric
+            n_classes = len(profile.class_distribution) if profile.class_distribution else None
+            canon_primary, canon_goal, _ = resolve_canonical_metric(profile.problem_type, n_classes)
+            self.primary_metric = canon_primary
+            self.optimization_goal = canon_goal
 
         meta = _extract_meta(profile)
         if self.enable_meta_memory:
@@ -277,14 +276,19 @@ class DecisionEngine:
 
     def receive_result(self, result: ExperimentResult) -> ActionDecision:
         # Backfill observed_gain for the previous decision row
+        from stratml.core.metrics import compute_semantic_gain, is_better_score, resolve_canonical_metric
+        if self.primary_metric is None and self._profile is not None:
+            n_classes = len(self._profile.class_distribution) if self._profile.class_distribution else None
+            self.primary_metric, self.optimization_goal, _ = resolve_canonical_metric(self._profile.problem_type, n_classes)
+
         metric_name = self.primary_metric or (
-            "r2" if self._profile and self._profile.problem_type == "regression" else "accuracy"
+            "rmse" if self._profile and self._profile.problem_type == "regression" else "roc_auc"
         )
         current_score = getattr(result.metrics, metric_name, None)
         if current_score is None:
             current_score = (
                 getattr(result.metrics, "r2", None)
-                if metric_name == "r2"
+                if metric_name in ("r2", "rmse")
                 else getattr(result.metrics, "accuracy", 0.0)
             )
         current_score = float(current_score or 0.0)
@@ -295,30 +299,19 @@ class DecisionEngine:
             execution_status = "failed"
             action_outcome = "failure"
             action_success = False
-            gain = (current_score - self._last_best_score) if self._last_best_score is not None else 0.0
+            gain = compute_semantic_gain(current_score, self._last_best_score, self.optimization_goal) if self._last_best_score is not None else 0.0
         elif self._last_best_score is not None:
             execution_status = "completed"
-            gain = current_score - self._last_best_score
-            if self.optimization_goal == "minimize":
-                if gain < 0.0:
-                    action_outcome = "improvement"
-                    action_success = True
-                elif gain > 0.0:
-                    action_outcome = "degradation"
-                    action_success = False
-                else:
-                    action_outcome = "neutral"
-                    action_success = True
+            gain = compute_semantic_gain(current_score, self._last_best_score, self.optimization_goal)
+            if gain > 1e-6:
+                action_outcome = "improvement"
+                action_success = True
+            elif gain < -1e-6:
+                action_outcome = "degradation"
+                action_success = False
             else:
-                if gain > 0.0:
-                    action_outcome = "improvement"
-                    action_success = True
-                elif gain < 0.0:
-                    action_outcome = "degradation"
-                    action_success = False
-                else:
-                    action_outcome = "neutral"
-                    action_success = True
+                action_outcome = "neutral"
+                action_success = True
         else:
             execution_status = "completed"
             action_outcome = "neutral"
@@ -339,15 +332,14 @@ class DecisionEngine:
                 dataset_fingerprint=self._dataset_fingerprint,
             )
 
-            if self._best_val_score is None:
+        if not is_failed:
+            if self._best_val_score is None or is_better_score(current_score, self._best_val_score, self.optimization_goal):
                 self._best_val_score = current_score
                 self._best_model = result.model_name
-            elif self.optimization_goal == "maximize" and current_score > self._best_val_score:
-                self._best_val_score = current_score
-                self._best_model = result.model_name
-            elif self.optimization_goal == "minimize" and current_score < self._best_val_score:
-                self._best_val_score = current_score
-                self._best_model = result.model_name
+                self._last_best_score = current_score
+            elif self._last_best_score is None:
+                self._last_best_score = current_score
+
 
         if result.model_name not in self._models_tried:
             self._models_tried.append(result.model_name)

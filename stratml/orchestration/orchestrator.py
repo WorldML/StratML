@@ -123,11 +123,26 @@ class ExecutionOrchestrator:
         )
         self.log(f"  Decision [iter 0]: action={action.action_type} | params={action.parameters} | trigger={trigger_iter0}")
 
+        # Resolve canonical primary metric, optimization goal, and task type
+        from stratml.core.metrics import resolve_canonical_metric, resolve_task_type, is_better_score
+        n_classes = len(profile.class_distribution) if profile.class_distribution else None
+        task_type = resolve_task_type(profile.problem_type, n_classes)
+        canonical_primary, canonical_goal, _ = resolve_canonical_metric(
+            profile.problem_type,
+            n_classes,
+            explicit_metric=getattr(self.decision_engine, "primary_metric", None),
+            explicit_goal=getattr(self.decision_engine, "optimization_goal", None),
+        )
+        primary_metric = getattr(self.decision_engine, "primary_metric", None) or canonical_primary
+        optimization_goal = getattr(self.decision_engine, "optimization_goal", None) or canonical_goal
+        self.primary_metric = primary_metric
+        self.optimization_goal = optimization_goal
+
         iteration     = 0
         total_runtime = 0.0
         current_model = action.parameters.get("model_name", "LogisticRegression")
         current_hyperparameters: dict = {}
-        best_val_score: float = float("-inf")
+        best_val_score: float = float("inf") if optimization_goal == "minimize" else float("-inf")
         best_config: Optional[ExperimentConfig] = None
         best_iteration: Optional[int] = None
 
@@ -183,18 +198,24 @@ class ExecutionOrchestrator:
                 train_curve=pipeline_result.train_curve,
                 val_curve=pipeline_result.val_curve,
                 problem_type=profile.problem_type,
+                y_proba=getattr(pipeline_result, "y_val_proba", None),
+                classes=getattr(pipeline_result, "classes", None),
+                task_type=task_type,
             )
 
-            primary = (
-                metrics.accuracy
-                if metrics.accuracy is not None
-                else (metrics.r2 if metrics.r2 is not None else 0.0)
-            )
-            is_best = primary > best_val_score
+            primary = getattr(metrics, primary_metric, None)
+            if primary is None:
+                primary = (
+                    metrics.accuracy
+                    if metrics.accuracy is not None
+                    else (metrics.r2 if metrics.r2 is not None else 0.0)
+                )
+            is_best = is_better_score(primary, best_val_score, optimization_goal)
             if is_best:
                 best_val_score = primary
                 best_config = config
                 best_iteration = iteration
+
 
             # ── Phase 7: Artifacts ────────────────────────────────────────────
             tb_dir = str(Path("outputs") / self.run_id / "tensorboard" / config.experiment_id) \
@@ -274,19 +295,32 @@ class ExecutionOrchestrator:
                     base_split, best_config.preprocessing, profile, transform_test=True, seed=self.split_config.random_seed
                 )
                 y_test_pred = best_model.predict(test_split.X_test)
+                y_test_proba = None
+                classes = getattr(best_model, "classes_", None)
+                if hasattr(best_model, "predict_proba"):
+                    try:
+                        y_test_proba = best_model.predict_proba(test_split.X_test)
+                    except Exception:
+                        y_test_proba = None
+
                 test_metrics = compute_metrics(
                     y_true=test_split.y_test,
                     y_pred=y_test_pred,
                     train_curve=[],
                     val_curve=[],
                     problem_type=profile.problem_type,
+                    y_proba=y_test_proba,
+                    classes=classes,
+                    task_type=task_type,
                 )
-                primary_test = (
-                    test_metrics.accuracy
-                    if test_metrics.accuracy is not None
-                    else (test_metrics.r2 if test_metrics.r2 is not None else 0.0)
-                )
-                self.log(f"  Test metrics (best model {best_config.model_name}): primary={primary_test:.4f}")
+                primary_test = getattr(test_metrics, primary_metric, None)
+                if primary_test is None:
+                    primary_test = (
+                        test_metrics.accuracy
+                        if test_metrics.accuracy is not None
+                        else (test_metrics.r2 if test_metrics.r2 is not None else 0.0)
+                    )
+                self.log(f"  Test metrics (best model {best_config.model_name}): primary={primary_test:.4f} ({primary_metric})")
                 # Persist test metrics alongside the model artifacts
                 import json
                 test_metrics_path = Path("outputs") / self.run_id / "artifacts" / "test_metrics.json"
@@ -317,21 +351,36 @@ class ExecutionOrchestrator:
                     import numpy as np
                     with torch.no_grad():
                         out = model(torch.tensor(X_test_np)).numpy()
+                    y_test_proba = None
                     if task == "regression":
                         y_test_pred = out.squeeze(1)
                     else:
                         label_map = {i: c for i, c in enumerate(classes)}
                         y_test_pred = np.array([label_map[i] for i in out.argmax(axis=1)])
+                        try:
+                            import torch.nn.functional as F
+                            y_test_proba = F.softmax(torch.tensor(out), dim=-1).numpy()
+                        except Exception:
+                            y_test_proba = None
+
                     test_metrics = compute_metrics(
-                        y_true=test_split.y_test, y_pred=y_test_pred,
-                        train_curve=[], val_curve=[], problem_type=profile.problem_type,
+                        y_true=test_split.y_test,
+                        y_pred=y_test_pred,
+                        train_curve=[],
+                        val_curve=[],
+                        problem_type=profile.problem_type,
+                        y_proba=y_test_proba,
+                        classes=classes,
+                        task_type=task_type,
                     )
-                    primary_test = (
-                        test_metrics.accuracy
-                        if test_metrics.accuracy is not None
-                        else (test_metrics.r2 if test_metrics.r2 is not None else 0.0)
-                    )
-                    self.log(f"  DL Test metrics: primary={primary_test:.4f}")
+                    primary_test = getattr(test_metrics, primary_metric, None)
+                    if primary_test is None:
+                        primary_test = (
+                            test_metrics.accuracy
+                            if test_metrics.accuracy is not None
+                            else (test_metrics.r2 if test_metrics.r2 is not None else 0.0)
+                        )
+                    self.log(f"  DL Test metrics: primary={primary_test:.4f} ({primary_metric})")
                     import json
                     test_metrics_path = Path("outputs") / self.run_id / "artifacts" / "test_metrics.json"
                     test_metrics_path.write_text(json.dumps(test_metrics.model_dump(), indent=2))
@@ -340,6 +389,7 @@ class ExecutionOrchestrator:
                     self.log(f"  DL test set evaluation failed: {exc}")
         else:
             self.log("  Skipped test set evaluation (no trained model).")
+
 
         # ── Computational Budget Accounting ──────────────────────────────────
         import json
@@ -551,11 +601,13 @@ class ExecutionOrchestrator:
                 "test_size": self.split_config.test_size,
                 "val_size": self.split_config.val_size,
                 "random_seed": self.split_config.random_seed,
-                "primary_metric": "r2" if profile.problem_type == "regression" else "accuracy",
-                "best_val_score": best_val_score if best_val_score != float("-inf") else None,
+                "primary_metric": primary_metric,
+                "optimization_goal": optimization_goal,
+                "best_val_score": best_val_score if best_val_score not in (float("-inf"), float("inf")) else None,
                 "best_iteration": best_iteration,
                 "best_model_name": getattr(best_config, "model_name", None),
             },
+
         }
 
         manifest_path = Path("outputs") / self.run_id / "manifest.json"

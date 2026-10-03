@@ -120,9 +120,12 @@ def _compute_cf_impact(decision: ActionDecision, result: ExperimentResult, state
     previous_best = decision.reason.evidence.get("best_score")
     if previous_best is None:
         previous_best = getattr(state.trajectory, "best_score", 0.0) or 0.0
-    actual_gain = primary - previous_best
+    from stratml.core.metrics import compute_semantic_gain
+    goal = getattr(state.objective, "optimization_goal", "maximize")
+    actual_gain = compute_semantic_gain(primary, previous_best, goal)
     expected_gain = decision.expected_gain or 0.0
     return round(actual_gain - expected_gain, 4)
+
 
 
 # ---------------------------------------------------------------------------

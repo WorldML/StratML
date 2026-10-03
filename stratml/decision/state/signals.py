@@ -60,39 +60,54 @@ def _clamp(v: float) -> float:
 # ---------------------------------------------------------------------------
 
 @tool
-def assess_fitting(primary: float, gap: float) -> str:
+def assess_fitting(primary: float, gap: float, goal: str = "maximize") -> str:
     """
     Assess underfitting, overfitting, and well_fitted signals.
 
     Args:
-        primary: Current primary metric score (e.g. accuracy), 0–1.
+        primary: Current primary metric score.
         gap:     val_loss - train_loss (generalisation gap).
+        goal:    Optimization goal ("maximize" | "minimize").
 
     Returns JSON with keys: underfitting, underfitting_confidence,
     overfitting, overfitting_confidence, well_fitted, well_fitted_confidence.
     Each signal is "none" | "weak" | "strong".
     """
-    uf_strong = primary < 0.60
-    uf_weak   = 0.60 <= primary < 0.70
-    of_strong = gap > 0.10
-    of_weak   = 0.05 < gap <= 0.10
-    not_uf    = not (uf_weak or uf_strong)
-    not_of    = not (of_weak or of_strong)
-    wf_strong = not_uf and not_of and primary >= 0.75
-    wf_weak   = not_uf and not_of and 0.70 <= primary < 0.75
+    if goal == "minimize":
+        of_strong = gap > 0.10
+        of_weak   = 0.05 < gap <= 0.10
+        uf_strong = primary > 1.20
+        uf_weak   = 0.70 < primary <= 1.20
+        not_uf    = not (uf_weak or uf_strong)
+        not_of    = not (of_weak or of_strong)
+        wf_strong = not_uf and not_of and primary <= 0.35
+        wf_weak   = not_uf and not_of and 0.35 < primary <= 0.70
+        wf_conf   = _clamp(1.0 - primary) if (wf_weak or wf_strong) else 0.0
+        uf_conf   = _clamp(primary / 2.0) if (uf_weak or uf_strong) else 0.0
+    else:
+        uf_strong = primary < 0.60
+        uf_weak   = 0.60 <= primary < 0.70
+        of_strong = gap > 0.10
+        of_weak   = 0.05 < gap <= 0.10
+        not_uf    = not (uf_weak or uf_strong)
+        not_of    = not (of_weak or of_strong)
+        wf_strong = not_uf and not_of and primary >= 0.75
+        wf_weak   = not_uf and not_of and 0.70 <= primary < 0.75
+        wf_conf   = _clamp(primary / 0.90) if (wf_weak or wf_strong) else 0.0
+        uf_conf   = _clamp((0.70 - primary) / 0.70)
 
     return json.dumps({
         "underfitting":            _strength(uf_weak, uf_strong),
-        "underfitting_confidence": _clamp((0.70 - primary) / 0.70),
+        "underfitting_confidence": uf_conf,
         "overfitting":             _strength(of_weak, of_strong),
         "overfitting_confidence":  _clamp(gap / 0.20),
         "well_fitted":             _strength(wf_weak, wf_strong),
-        "well_fitted_confidence":  _clamp(primary / 0.90) if (wf_weak or wf_strong) else 0.0,
+        "well_fitted_confidence":  wf_conf,
     })
 
 
 @tool
-def assess_convergence(slope: float, primary: float, steps_since: int) -> str:
+def assess_convergence(slope: float, primary: float, steps_since: int, goal: str = "maximize") -> str:
     """
     Assess converged, stagnating, and diverging signals.
 
@@ -100,16 +115,24 @@ def assess_convergence(slope: float, primary: float, steps_since: int) -> str:
         slope:       Trend slope of the primary metric over recent history.
         primary:     Current primary metric score.
         steps_since: Iterations since last improvement.
+        goal:        Optimization goal ("maximize" | "minimize").
 
     Returns JSON with keys: converged, converged_confidence,
     stagnating, stagnating_confidence, diverging, diverging_confidence.
     """
-    cv_strong = abs(slope) < 0.001 and primary >= 0.75
-    cv_weak   = abs(slope) < 0.005 and primary >= 0.70
+    effective_slope = -slope if goal == "minimize" else slope
+
+    if goal == "minimize":
+        cv_strong = abs(slope) < 0.001 and (primary <= 0.35 or steps_since == 0)
+        cv_weak   = abs(slope) < 0.005 and (primary <= 0.70 or steps_since <= 1)
+    else:
+        cv_strong = abs(slope) < 0.001 and primary >= 0.75
+        cv_weak   = abs(slope) < 0.005 and primary >= 0.70
+
     sg_strong = steps_since >= 4 and not (cv_weak or cv_strong)
     sg_weak   = steps_since >= 2 and not (cv_weak or cv_strong)
-    dv_strong = slope < -0.02
-    dv_weak   = -0.02 <= slope < -0.01
+    dv_strong = effective_slope < -0.02
+    dv_weak   = -0.02 <= effective_slope < -0.01
 
     return json.dumps({
         "converged":            _strength(cv_weak, cv_strong),
@@ -117,8 +140,9 @@ def assess_convergence(slope: float, primary: float, steps_since: int) -> str:
         "stagnating":            _strength(sg_weak, sg_strong),
         "stagnating_confidence": _clamp(steps_since / 5.0) if (sg_weak or sg_strong) else 0.0,
         "diverging":             _strength(dv_weak, dv_strong),
-        "diverging_confidence":  _clamp(abs(slope) / 0.05) if (dv_weak or dv_strong) else 0.0,
+        "diverging_confidence":  _clamp(abs(effective_slope) / 0.05) if (dv_weak or dv_strong) else 0.0,
     })
+
 
 
 @tool
@@ -217,14 +241,16 @@ def _rule_based(state: StateObject) -> StateSignals:
     t = state.trajectory
     r = state.resources
     primary = state.metrics.primary
+    goal = getattr(state.objective, "optimization_goal", "maximize")
 
-    fit  = json.loads(assess_fitting.func(primary, g.gap))
-    conv = json.loads(assess_convergence.func(t.slope, primary, t.steps_since_improvement))
+    fit  = json.loads(assess_fitting.func(primary, g.gap, goal=goal))
+    conv = json.loads(assess_convergence.func(t.slope, primary, t.steps_since_improvement, goal=goal))
     stab = json.loads(assess_stability.func(g.train_loss, g.validation_loss, t.volatility))
     eff  = json.loads(assess_efficiency.func(r.runtime))
     opt  = json.loads(assess_optimization.func(t.steps_since_improvement, t.improvement_rate))
 
     return StateSignals(**{**fit, **conv, **stab, **eff, **opt})
+
 
 
 # ---------------------------------------------------------------------------

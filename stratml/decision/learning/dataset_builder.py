@@ -175,9 +175,16 @@ def backfill_last_gain(
 
                 row["observed_gain"] = str(round(gain, 6))
                 best = float(row.get("best_score") or 0.0)
-                headroom = 1.0 - best
+                metric = row.get("primary_metric", "accuracy")
+                if metric in ("rmse", "mse", "mae", "log_loss"):
+                    headroom = max(abs(best), 1e-4)
+                elif best <= 1.0:
+                    headroom = max(1.0 - best, 1e-4)
+                else:
+                    headroom = max(abs(best), 1.0)
                 row["normalized_gain"] = str(round(gain / headroom, 6)) if headroom > 1e-6 else str(round(gain, 6))
                 row["status"] = status
+
                 updated_any = True
                 break
 

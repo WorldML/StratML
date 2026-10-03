@@ -125,12 +125,11 @@ def build_state(
         history = ExperimentHistory()
     history.push(result)
     if profile is not None and getattr(profile, "problem_type", None) == "regression" and primary_metric == "accuracy":
-        primary_metric = "r2"
-    traj = history.compute_trajectory(primary_metric)
+        primary_metric = "rmse"
+        optimization_goal = "minimize"
+    traj = history.compute_trajectory(primary_metric, optimization_goal=optimization_goal)
 
     improvement_rate = traj.improvement_rate
-    if optimization_goal == "minimize":
-        improvement_rate = -improvement_rate
 
     if profile is not None:
         meta = extract_meta(profile)
@@ -162,14 +161,17 @@ def build_state(
         ),
         objective=StateObjective(primary_metric=primary_metric, optimization_goal=optimization_goal),
         metrics=StateMetrics(
-            primary=traj.best_score if optimization_goal == "maximize" else traj.mean_score,
+            primary=traj.best_score,
             secondary=SecondaryMetrics(
                 accuracy=result.metrics.accuracy,
                 precision=result.metrics.precision,
                 recall=result.metrics.recall,
                 f1_score=result.metrics.f1_score,
+                roc_auc=result.metrics.roc_auc,
+                log_loss=result.metrics.log_loss,
                 mse=result.metrics.mse,
                 rmse=result.metrics.rmse,
+                mae=result.metrics.mae,
                 r2=result.metrics.r2,
             ),
             train_val_gap=gap,
@@ -184,6 +186,7 @@ def build_state(
             steps_since_improvement=traj.steps_since_improvement,
             trend=traj.trend,
         ),
+
         dataset=StateDataset(
             num_samples=num_samples,
             num_features=num_features,

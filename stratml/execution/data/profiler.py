@@ -42,8 +42,9 @@ def build_profile(dataset: Dataset, random_seed: int = 42) -> DataProfile:
         missing_value_ratio=round(float(global_missing), 4),
         class_distribution=class_distribution,
         feature_summary=feature_summary,
-        recommended_metrics=_recommend_metrics(problem_type),
+        recommended_metrics=_recommend_metrics(problem_type, class_distribution),
         imbalance_ratio=imbalance_ratio,
+
         feature_variance_mean=feature_variance_mean,
         class_entropy=class_entropy,
         dataset_fingerprint=getattr(dataset, "dataset_fingerprint", None),
@@ -106,10 +107,12 @@ def _infer_distribution(series: pd.Series, random_seed: int = 42) -> str:
     return "unknown"
 
 
-def _recommend_metrics(problem_type: str) -> list[str]:
-    if problem_type == "classification":
-        return ["accuracy", "f1_score"]
-    return ["mse", "rmse", "r2"]
+def _recommend_metrics(problem_type: str, class_distribution: dict[str, int] | None = None) -> list[str]:
+    from stratml.core.metrics import resolve_canonical_metric
+    n_classes = len(class_distribution) if class_distribution else None
+    primary, _, secondary = resolve_canonical_metric(problem_type, n_classes)
+    return [primary] + [s for s in secondary if s != primary]
+
 
 
 def _imbalance_ratio(class_distribution: dict[str, int]) -> float | None:

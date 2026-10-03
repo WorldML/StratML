@@ -70,11 +70,15 @@ class ExperimentMetrics(BaseModel):
     f1_score: Optional[float] = None
     precision: Optional[float] = None
     recall: Optional[float] = None
+    roc_auc: Optional[float] = None
+    log_loss: Optional[float] = None
     train_loss: Optional[float] = None
     validation_loss: Optional[float] = None
     mse: Optional[float] = None
     rmse: Optional[float] = None
+    mae: Optional[float] = None
     r2: Optional[float] = None
+
 
 
 class ResourceUsage(BaseModel):

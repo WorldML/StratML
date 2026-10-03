@@ -113,6 +113,8 @@ class MLPipelineResult:
     runtime: float
     fit_count: int = 1
     eval_count: int = 1
+    y_val_proba: Optional[np.ndarray] = None
+    classes: Optional[np.ndarray] = None
 
 
 def run_ml_pipeline(config: ExperimentConfig, data_split: DataSplit) -> MLPipelineResult:
@@ -126,6 +128,10 @@ def run_ml_pipeline(config: ExperimentConfig, data_split: DataSplit) -> MLPipeli
     seed = getattr(config, "seed", 42)
     if "random_state" in valid_params and "random_state" not in hp:
         hp["random_state"] = seed
+
+    # Enable predict_proba for SVC classifier
+    if config.model_name == "SVC" and "probability" in valid_params and "probability" not in hp:
+        hp["probability"] = True
 
     t0 = time.perf_counter()
 
@@ -165,13 +171,40 @@ def run_ml_pipeline(config: ExperimentConfig, data_split: DataSplit) -> MLPipeli
     runtime = round(time.perf_counter() - t0, 4)
     y_val_pred = model.predict(data_split.X_val)
 
-    try:
-        from sklearn.metrics import log_loss
-        train_loss = round(float(log_loss(data_split.y_train, model.predict_proba(data_split.X_train))), 6)
-        val_loss   = round(float(log_loss(data_split.y_val,   model.predict_proba(data_split.X_val))),   6)
-    except Exception:
-        train_loss = 0.0
-        val_loss   = 0.0
+    # Extract class labels and probabilities where available
+    y_val_proba: Optional[np.ndarray] = None
+    classes: Optional[np.ndarray] = getattr(model, "classes_", None)
+
+    if hasattr(model, "predict_proba"):
+        try:
+            y_val_proba = model.predict_proba(data_split.X_val)
+        except Exception:
+            y_val_proba = None
+
+    # Compute train and val loss curves
+    is_classifier = config.model_name in PAPER_CLASSIFICATION_MODELS or hasattr(model, "classes_")
+    if is_classifier:
+        try:
+            from sklearn.metrics import log_loss
+            if hasattr(model, "predict_proba") and y_val_proba is not None:
+                train_proba = model.predict_proba(data_split.X_train)
+                train_loss = round(float(log_loss(data_split.y_train, train_proba, labels=classes)), 6)
+                val_loss   = round(float(log_loss(data_split.y_val,   y_val_proba, labels=classes)), 6)
+            else:
+                train_loss = 0.0
+                val_loss   = 0.0
+        except Exception:
+            train_loss = 0.0
+            val_loss   = 0.0
+    else:
+        try:
+            from sklearn.metrics import mean_squared_error
+            y_train_pred = model.predict(data_split.X_train)
+            train_loss = round(float(np.sqrt(mean_squared_error(data_split.y_train, y_train_pred))), 6)
+            val_loss   = round(float(np.sqrt(mean_squared_error(data_split.y_val,   y_val_pred))),   6)
+        except Exception:
+            train_loss = 0.0
+            val_loss   = 0.0
 
     return MLPipelineResult(
         model=model,
@@ -181,4 +214,7 @@ def run_ml_pipeline(config: ExperimentConfig, data_split: DataSplit) -> MLPipeli
         runtime=runtime,
         fit_count=fit_count,
         eval_count=eval_count,
+        y_val_proba=y_val_proba,
+        classes=classes,
     )
+
