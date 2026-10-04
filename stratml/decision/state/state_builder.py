@@ -45,6 +45,7 @@ def build_state_from_profile(
     allowed_models: Optional[list[str]] = None,
     max_iterations: int = 20,
     time_budget: Optional[float] = None,
+    evaluation_budget: Optional[int] = None,
 ) -> StateObject:
     """Iteration 0 entry point — bootstrap StateObject from DataProfile."""
     num_samples = profile.rows
@@ -55,6 +56,8 @@ def build_state_from_profile(
     if class_dist and len(class_dist) >= 2:
         counts = list(class_dist.values())
         imbalance_ratio = round(max(counts) / max(min(counts), 1), 4)
+
+    effective_budget = evaluation_budget if evaluation_budget is not None else max_iterations
 
     return StateObject(
         meta=StateMeta(
@@ -87,7 +90,8 @@ def build_state_from_profile(
         generalization=StateGeneralization(train_loss=0.0, validation_loss=0.0, gap=0.0),
         resources=StateResources(
             runtime=0.0, gpu_used=False, cpu_time=0.0,
-            remaining_budget=float(max_iterations), budget_exhausted=False,
+            remaining_budget=float(effective_budget), budget_exhausted=False,
+            actual_evaluations=0, actual_fits=0,
         ),
         search=StateSearch(models_tried=[], unique_models_count=0, repeated_configs=0),
         signals=StateSignals(),
@@ -95,8 +99,9 @@ def build_state_from_profile(
         action_context=StateActionContext(),
         constraints=StateConstraints(
             allowed_models=allowed_models or [],
-            max_iterations=max_iterations,
+            max_iterations=effective_budget,
             time_budget=time_budget,
+            evaluation_budget=effective_budget,
         ),
     )
 
@@ -119,6 +124,9 @@ def build_state(
     previous_signals=None,
     execution_status: Optional[str] = "completed",
     action_outcome: Optional[str] = None,
+    evaluation_budget: Optional[int] = None,
+    actual_evaluations: int = 0,
+    actual_fits: int = 0,
 ) -> StateObject:
     """Iteration 1+ entry point — full pipeline from ExperimentResult."""
     if history is None:
@@ -152,6 +160,8 @@ def build_state(
     models_tried = list(models_tried or [result.model_name])
     if result.model_name not in models_tried:
         models_tried.append(result.model_name)
+
+    effective_budget = evaluation_budget if evaluation_budget is not None else max_iterations
 
     state = StateObject(
         meta=StateMeta(
@@ -212,6 +222,8 @@ def build_state(
             cpu_time=result.resource_usage.cpu_time_sec,
             remaining_budget=remaining_budget,
             budget_exhausted=(remaining_budget is not None and remaining_budget <= 0),
+            actual_evaluations=actual_evaluations,
+            actual_fits=actual_fits,
         ),
         search=StateSearch(
             models_tried=models_tried,
@@ -230,8 +242,9 @@ def build_state(
         ),
         constraints=StateConstraints(
             allowed_models=allowed_models or [],
-            max_iterations=max_iterations,
+            max_iterations=effective_budget,
             time_budget=time_budget,
+            evaluation_budget=effective_budget,
         ),
     )
 

@@ -14,7 +14,7 @@ from copy import deepcopy
 DEFAULT_CONFIG: dict = {
     "mode": "beginner",
     "dataset": {"path": None, "target_column": None},
-    "execution": {"max_iterations": 5, "timeout_per_run": 300, "random_seed": 42, "tune": False},
+    "execution": {"evaluation_budget": 20, "max_iterations": 5, "timeout_per_run": 300, "random_seed": 42, "tune": False},
     "split": {"method": "stratified", "test_size": 0.2},
     "logging": {"enable_mlflow": False, "enable_tensorboard": False, "log_level": "info"},
     "constraints": {"max_memory": None, "max_cpu": None},
@@ -56,8 +56,12 @@ def apply_cli_overrides(config: dict, args) -> dict:
     config = deepcopy(config)
     if getattr(args, "mode", None) is not None:
         config["mode"] = args.mode
+    if getattr(args, "budget", None) is not None:
+        config["execution"]["evaluation_budget"] = args.budget
+        config["execution"]["max_iterations"] = args.budget
     if getattr(args, "max_iter", None) is not None:
         config["execution"]["max_iterations"] = args.max_iter
+        config["execution"]["evaluation_budget"] = args.max_iter
     if getattr(args, "path", None) is not None:
         config["dataset"]["path"] = args.path
     dl = config.setdefault("deep_learning", {})

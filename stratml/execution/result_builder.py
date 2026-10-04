@@ -27,6 +27,10 @@ def build_experiment_result(
     dataset_name: str,
     early_stopped: Optional[bool] = None,
     best_epoch: Optional[int] = None,
+    status: Optional[str] = None,
+    failed: Optional[bool] = None,
+    eval_count: int = 1,
+    fit_count: int = 1,
 ) -> ExperimentResult:
     return ExperimentResult(
         experiment_id=config.experiment_id,
@@ -44,4 +48,8 @@ def build_experiment_result(
         artifacts=artifacts,
         early_stopped=early_stopped,
         best_epoch=best_epoch,
+        status=status,
+        failed=failed,
+        eval_count=eval_count,
+        fit_count=fit_count,
     )

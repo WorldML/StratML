@@ -45,7 +45,9 @@ class DecisionEngine:
         primary_metric: Optional[str] = None,
         optimization_goal: str = "maximize",
         allowed_models: Optional[list[str]] = None,
-        max_iterations: int = 20,
+        evaluation_budget: Optional[int] = None,
+        max_iterations: Optional[int] = None,
+        budget: Optional[int] = None,
         time_budget: Optional[float] = None,
         run_id: Optional[str] = None,
         dl_hyperparams: Optional[dict] = None,
@@ -59,7 +61,16 @@ class DecisionEngine:
         self.optimization_goal = optimization_goal
         self._metric_explicit  = primary_metric is not None
         self.allowed_models    = allowed_models
-        self.max_iterations    = max_iterations
+        if evaluation_budget is not None:
+            self._evaluation_budget = evaluation_budget
+        elif budget is not None:
+            self._evaluation_budget = budget
+        elif max_iterations is not None:
+            self._evaluation_budget = max_iterations
+        else:
+            self._evaluation_budget = 20
+        self.actual_evaluations = 0
+        self.actual_fits        = 0
         self.time_budget       = time_budget
         self.dl_hyperparams    = dl_hyperparams or {}
         self.seed              = seed
@@ -146,6 +157,26 @@ class DecisionEngine:
         self._start_snapshot_locked = False
         self._start_snapshot = None
         self.start_snapshot = self.capture_start_snapshot()
+
+    @property
+    def evaluation_budget(self) -> int:
+        return self._evaluation_budget
+
+    @evaluation_budget.setter
+    def evaluation_budget(self, val: int) -> None:
+        self._evaluation_budget = val
+
+    @property
+    def max_iterations(self) -> int:
+        return self._evaluation_budget
+
+    @max_iterations.setter
+    def max_iterations(self, val: int) -> None:
+        self._evaluation_budget = val
+
+    @property
+    def configured_budget(self) -> int:
+        return self._evaluation_budget
 
     def capture_start_snapshot(self, lock: bool = False) -> dict:
         """Capture immutable start snapshot of historical experience at experiment initialization."""
@@ -271,6 +302,7 @@ class DecisionEngine:
             allowed_models=allowed,
             max_iterations=self.max_iterations,
             time_budget=self.time_budget,
+            evaluation_budget=self.evaluation_budget,
         )
         return self._decide(state)
 
@@ -346,7 +378,11 @@ class DecisionEngine:
         else:
             self._repeated_configs += 1
 
-        remaining = max(0.0, self.max_iterations - result.iteration)
+        evals_this = getattr(result, "eval_count", 1)
+        self.actual_evaluations += evals_this
+        self.actual_fits += getattr(result, "fit_count", 1)
+
+        remaining = max(0.0, float(self.evaluation_budget - self.actual_evaluations))
         state = build_state(
             result,
             history=self._history,
@@ -364,6 +400,9 @@ class DecisionEngine:
             previous_signals=self._last_signals,
             execution_status=self._last_execution_status,
             action_outcome=self._last_action_outcome,
+            evaluation_budget=self.evaluation_budget,
+            actual_evaluations=self.actual_evaluations,
+            actual_fits=self.actual_fits,
         )
         if self._last_decision is not None:
             eval_log = self._out_dir / "decision_logs" / "evaluation_log.jsonl"

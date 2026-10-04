@@ -138,10 +138,13 @@ def run_ml_pipeline(config: ExperimentConfig, data_split: DataSplit) -> MLPipeli
     if config.tune and config.model_name in _PARAM_GRIDS:
         from sklearn.model_selection import RandomizedSearchCV
         base = cls(**hp)
+        n_iter = 10
+        if getattr(config, "max_evaluations", None) is not None:
+            n_iter = max(1, min(10, int(config.max_evaluations)))
         search = RandomizedSearchCV(
             base,
             _PARAM_GRIDS[config.model_name],
-            n_iter=10,
+            n_iter=n_iter,
             cv=3,
             random_state=seed,
             n_jobs=-1,

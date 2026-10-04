@@ -54,7 +54,9 @@ class ExecutionOrchestrator:
         log: Optional[Callable[[str], None]] = None,
         enable_mlflow: bool = False,
         tune: bool = False,
+        evaluation_budget: int | None = None,
         max_iterations: int | None = None,
+        budget: int | None = None,
         resolved_config: Optional[dict] = None,
     ) -> None:
         self.send_profile  = send_profile
@@ -65,16 +67,54 @@ class ExecutionOrchestrator:
         self.log           = log or (lambda msg: None)
         self.enable_mlflow = enable_mlflow
         self.tune          = tune
-        self.max_iterations = max_iterations if max_iterations is not None else 5
+        # Canonical budget resolution: evaluation_budget > budget > max_iterations > default (20)
+        if evaluation_budget is not None:
+            self._evaluation_budget = int(evaluation_budget)
+        elif budget is not None:
+            self._evaluation_budget = int(budget)
+        elif max_iterations is not None:
+            self._evaluation_budget = int(max_iterations)
+        else:
+            self._evaluation_budget = 20
         self.resolved_config = resolved_config
         self.decision_iterations = 0
         self.actual_fits = 0
         self.actual_evaluations = 0
         self.total_runtime = 0.0
+        self.decision_engine = getattr(self.send_profile, "__self__", None)
+        self.termination_reason = "in_progress"
         self.budget_accounting: dict = {}
         self.manifest: dict | None = None
 
+    @property
+    def evaluation_budget(self) -> int:
+        return self._evaluation_budget
+
+    @evaluation_budget.setter
+    def evaluation_budget(self, val: int) -> None:
+        self._evaluation_budget = val
+
+    @property
+    def max_iterations(self) -> int:
+        return self._evaluation_budget
+
+    @max_iterations.setter
+    def max_iterations(self, val: int) -> None:
+        self._evaluation_budget = val
+
+    @property
+    def configured_budget(self) -> int:
+        return self._evaluation_budget
+
     def run(self, dataset_path: str, target_column: str) -> None:
+        try:
+            self._run_internal(dataset_path, target_column)
+        except Exception:
+            if self.termination_reason == "in_progress":
+                self.termination_reason = "execution_failure"
+            raise
+
+    def _run_internal(self, dataset_path: str, target_column: str) -> None:
         # ── Capture start snapshot before any profiling, training, or decision cycle can mutate experience (P1-28 & P1-30) ──
         engine = getattr(self.send_profile, "__self__", None)
         if engine is not None and self.resolved_config and "ablations" in self.resolved_config:
@@ -127,14 +167,15 @@ class ExecutionOrchestrator:
         from stratml.core.metrics import resolve_canonical_metric, resolve_task_type, is_better_score
         n_classes = len(profile.class_distribution) if profile.class_distribution else None
         task_type = resolve_task_type(profile.problem_type, n_classes)
+        engine_obj = getattr(self, "decision_engine", None) or getattr(self.send_profile, "__self__", None)
         canonical_primary, canonical_goal, _ = resolve_canonical_metric(
             profile.problem_type,
             n_classes,
-            explicit_metric=getattr(self.decision_engine, "primary_metric", None),
-            explicit_goal=getattr(self.decision_engine, "optimization_goal", None),
+            explicit_metric=getattr(engine_obj, "primary_metric", None),
+            explicit_goal=getattr(engine_obj, "optimization_goal", None),
         )
-        primary_metric = getattr(self.decision_engine, "primary_metric", None) or canonical_primary
-        optimization_goal = getattr(self.decision_engine, "optimization_goal", None) or canonical_goal
+        primary_metric = getattr(engine_obj, "primary_metric", None) or canonical_primary
+        optimization_goal = getattr(engine_obj, "optimization_goal", None) or canonical_goal
         self.primary_metric = primary_metric
         self.optimization_goal = optimization_goal
 
@@ -146,9 +187,33 @@ class ExecutionOrchestrator:
         best_config: Optional[ExperimentConfig] = None
         best_iteration: Optional[int] = None
 
+        if action.action_type == "terminate":
+            self.termination_reason = "agent_terminated"
+
         while action.action_type != "terminate":
+            # ── Hard evaluation ceiling check before starting an evaluation ──
+            if self.actual_evaluations >= self.evaluation_budget:
+                self.termination_reason = "budget_exhausted"
+                self.log(
+                    f"  [Budget] Hard evaluation ceiling reached: {self.actual_evaluations} >= {self.evaluation_budget}. Terminating search."
+                )
+                break
+
+            # ── Soft time budget check ───────────────────────────────────────
+            if self.time_budget and total_runtime >= self.time_budget:
+                self.termination_reason = "budget_exhausted"
+                self.log(
+                    f"  [Budget] Soft timeout reached: runtime {total_runtime:.2f}s >= budget {self.time_budget:.2f}s. Terminating search."
+                )
+                break
+
+            remaining_budget = max(0, self.evaluation_budget - self.actual_evaluations)
+            if remaining_budget <= 0:
+                self.termination_reason = "budget_exhausted"
+                break
+
             iteration += 1
-            self.log(f"\n  --- Iteration {iteration} ---")
+            self.log(f"\n  --- Iteration {iteration} (Evaluations: {self.actual_evaluations}/{self.evaluation_budget}) ---")
             if "model_name" not in action.parameters:
                 action.parameters["model_name"] = current_model
             # Carry forward previous hyperparameters for capacity/regularization actions
@@ -159,7 +224,12 @@ class ExecutionOrchestrator:
             self.log(f"  Training : {current_model} ({action.action_type}) ...")
 
             # ── Phase 4: Translate ActionDecision → ExperimentConfig ─────────
-            config = build_experiment_config(action, tune=self.tune, seed=self.split_config.random_seed)
+            config = build_experiment_config(
+                action,
+                tune=self.tune,
+                seed=self.split_config.random_seed,
+                max_evaluations=remaining_budget,
+            )
             current_hyperparameters = dict(config.hyperparameters)
 
             # ── Phase 4b: Apply preprocessing ────────────────────────────────
@@ -170,90 +240,121 @@ class ExecutionOrchestrator:
             # ── Phase 5: Train ────────────────────────────────────────────────
             t_start = time.perf_counter()
             dl_result = None
-            if config.model_type == "ml":
-                pipeline_result = run_ml_pipeline(config, clean_split)
-            else:
-                from stratml.execution.pipelines.dl_pipeline import run_dl_pipeline
-                tb_dir_train = str(Path("outputs") / self.run_id / "tensorboard" / config.experiment_id)
-                pipeline_result = run_dl_pipeline(config, clean_split, tensorboard_log_dir=tb_dir_train)
-                dl_result = pipeline_result
+            pipeline_result = None
+            eval_failed = False
+            fail_exc = None
+            try:
+                if config.model_type == "ml":
+                    pipeline_result = run_ml_pipeline(config, clean_split)
+                else:
+                    from stratml.execution.pipelines.dl_pipeline import run_dl_pipeline
+                    tb_dir_train = str(Path("outputs") / self.run_id / "tensorboard" / config.experiment_id)
+                    pipeline_result = run_dl_pipeline(config, clean_split, tensorboard_log_dir=tb_dir_train)
+                    dl_result = pipeline_result
+            except Exception as exc:
+                eval_failed = True
+                fail_exc = exc
+                self.log(f"  [Failed Evaluation] Candidate model execution failed: {exc}")
+
             run_time = round(time.perf_counter() - t_start, 4)
             total_runtime += run_time
             self.total_runtime = total_runtime
             self.decision_iterations = iteration
-            fits_this_iter = getattr(pipeline_result, "fit_count", 1)
-            evals_this_iter = getattr(pipeline_result, "eval_count", 1)
+
+            # Evaluation & Fit Accounting:
+            # Rule: Attempted evaluations that fail STILL consume 1 model evaluation attempt from the budget.
+            # This guarantees failures cannot cause infinite retries outside the budget.
+            if eval_failed:
+                fits_this_iter = 1
+                evals_this_iter = 1
+            else:
+                fits_this_iter = getattr(pipeline_result, "fit_count", 1)
+                evals_this_iter = getattr(pipeline_result, "eval_count", 1)
+
             self.actual_fits += fits_this_iter
             self.actual_evaluations += evals_this_iter
 
             dl_info = ""
             if dl_result is not None:
                 dl_info = f" | device={dl_result.device_used} | epochs={dl_result.epochs_run} | early_stopped={dl_result.early_stopped}"
-            self.log(f"  Trained in {run_time:.2f}s (fits={fits_this_iter}){dl_info}")
+            self.log(f"  Trained in {run_time:.2f}s (evals={evals_this_iter}, fits={fits_this_iter}){dl_info}")
 
             # ── Phase 6: Metrics ──────────────────────────────────────────────
-            metrics = compute_metrics(
-                y_true=clean_split.y_val,
-                y_pred=pipeline_result.y_val_pred,
-                train_curve=pipeline_result.train_curve,
-                val_curve=pipeline_result.val_curve,
-                problem_type=profile.problem_type,
-                y_proba=getattr(pipeline_result, "y_val_proba", None),
-                classes=getattr(pipeline_result, "classes", None),
-                task_type=task_type,
-            )
-
-            primary = getattr(metrics, primary_metric, None)
-            if primary is None:
-                primary = (
-                    metrics.accuracy
-                    if metrics.accuracy is not None
-                    else (metrics.r2 if metrics.r2 is not None else 0.0)
+            if eval_failed:
+                from stratml.execution.schemas import ExperimentMetrics, ArtifactRefs
+                metrics = ExperimentMetrics(
+                    accuracy=0.0 if profile.problem_type == "classification" else None,
+                    roc_auc=0.0 if profile.problem_type == "classification" else None,
+                    log_loss=999.0 if profile.problem_type == "classification" else None,
+                    rmse=999999.0 if profile.problem_type == "regression" else None,
+                    mae=999999.0 if profile.problem_type == "regression" else None,
+                    r2=-999999.0 if profile.problem_type == "regression" else None,
                 )
-            is_best = is_better_score(primary, best_val_score, optimization_goal)
-            if is_best:
-                best_val_score = primary
-                best_config = config
-                best_iteration = iteration
+                primary = 999999.0 if optimization_goal == "minimize" else -999999.0
+                is_best = False
+                artifacts = ArtifactRefs(model_path="", metrics_file="", tensorboard_logs="")
+            else:
+                metrics = compute_metrics(
+                    y_true=clean_split.y_val,
+                    y_pred=pipeline_result.y_val_pred,
+                    train_curve=pipeline_result.train_curve,
+                    val_curve=pipeline_result.val_curve,
+                    problem_type=profile.problem_type,
+                    y_proba=getattr(pipeline_result, "y_val_proba", None),
+                    classes=getattr(pipeline_result, "classes", None),
+                    task_type=task_type,
+                )
 
+                primary = getattr(metrics, primary_metric, None)
+                if primary is None:
+                    primary = (
+                        metrics.accuracy
+                        if metrics.accuracy is not None
+                        else (metrics.r2 if metrics.r2 is not None else 0.0)
+                    )
+                is_best = is_better_score(primary, best_val_score, optimization_goal)
+                if is_best:
+                    best_val_score = primary
+                    best_config = config
+                    best_iteration = iteration
 
-            # ── Phase 7: Artifacts ────────────────────────────────────────────
-            tb_dir = str(Path("outputs") / self.run_id / "tensorboard" / config.experiment_id) \
-                if config.model_type == "dl" else None
+                # ── Phase 7: Artifacts ────────────────────────────────────────────
+                tb_dir = str(Path("outputs") / self.run_id / "tensorboard" / config.experiment_id) \
+                    if config.model_type == "dl" else None
 
-            # Save this iteration's artifacts in its dedicated subfolder
-            iter_artifacts_root = Path("outputs") / self.run_id / "artifacts" / f"iter_{iteration}"
-            artifacts = save_artifacts(
-                experiment_id=config.experiment_id,
-                model=pipeline_result.model,
-                metrics=metrics,
-                config=config,
-                tensorboard_log_dir=tb_dir,
-                artifacts_root=iter_artifacts_root,
-                dl_result=dl_result,
-                enable_mlflow=self.enable_mlflow,
-            )
-
-            # Preserve model artifact corresponding to the BEST validation score at the root
-            if is_best:
-                save_artifacts(
+                # Save this iteration's artifacts in its dedicated subfolder
+                iter_artifacts_root = Path("outputs") / self.run_id / "artifacts" / f"iter_{iteration}"
+                artifacts = save_artifacts(
                     experiment_id=config.experiment_id,
                     model=pipeline_result.model,
                     metrics=metrics,
                     config=config,
                     tensorboard_log_dir=tb_dir,
-                    artifacts_root=Path("outputs") / self.run_id / "artifacts",
+                    artifacts_root=iter_artifacts_root,
                     dl_result=dl_result,
-                    enable_mlflow=False,
+                    enable_mlflow=self.enable_mlflow,
                 )
+
+                # Preserve model artifact corresponding to the BEST validation score at the root
+                if is_best:
+                    save_artifacts(
+                        experiment_id=config.experiment_id,
+                        model=pipeline_result.model,
+                        metrics=metrics,
+                        config=config,
+                        tensorboard_log_dir=tb_dir,
+                        artifacts_root=Path("outputs") / self.run_id / "artifacts",
+                        dl_result=dl_result,
+                        enable_mlflow=False,
+                    )
 
             # ── Phase 8: Assemble ExperimentResult ───────────────────────────
             gpu_used = dl_result is not None and dl_result.device_used != "cpu"
             result = build_experiment_result(
                 config=config,
                 metrics=metrics,
-                train_curve=pipeline_result.train_curve,
-                validation_curve=pipeline_result.val_curve,
+                train_curve=pipeline_result.train_curve if pipeline_result else [],
+                validation_curve=pipeline_result.val_curve if pipeline_result else [],
                 runtime=run_time,
                 resource_usage=ResourceUsage(cpu_time_sec=run_time, gpu_used=gpu_used),
                 artifacts=artifacts,
@@ -262,26 +363,60 @@ class ExecutionOrchestrator:
                 dataset_name=profile.dataset_name,
                 early_stopped=dl_result.early_stopped if dl_result else None,
                 best_epoch=dl_result.best_epoch if dl_result else None,
+                status="failed" if eval_failed else "completed",
+                failed=eval_failed,
+                eval_count=evals_this_iter,
+                fit_count=fits_this_iter,
             )
 
             # ── Budget check (soft timeout) ───────────────────────────────────
             if self.time_budget and total_runtime >= self.time_budget:
+                self.termination_reason = "budget_exhausted"
                 self.log(
                     f"  [Budget] Soft timeout reached: runtime {total_runtime:.2f}s >= budget {self.time_budget:.2f}s. "
                     f"Completed iteration {iteration} cleanly without interrupting in-flight fit."
                 )
+                try:
+                    self.send_result(result)
+                except Exception:
+                    pass
+                break
+
+            # ── Budget check (hard evaluation ceiling) ────────────────────────
+            if self.actual_evaluations >= self.evaluation_budget:
+                self.termination_reason = "budget_exhausted"
+                self.log(
+                    f"  [Budget] Hard evaluation ceiling reached: evaluations {self.actual_evaluations} >= budget {self.evaluation_budget}. "
+                    f"Completed iteration {iteration} cleanly."
+                )
+                try:
+                    self.send_result(result)
+                except Exception:
+                    pass
                 break
 
             # ── Send result to Team B, receive next ActionDecision ────────────
             self.log(f"  Result   : primary={primary:.4f} | runtime={run_time:.2f}s")
             self.log("  Evaluating signals & deciding next action...")
             action = self.send_result(result)
+            if action.action_type == "terminate":
+                self.termination_reason = "agent_terminated"
+                self.log(f"  Decision : terminate | trigger={getattr(action.reason, 'trigger', str(action.reason))}")
+                break
+
             trigger_next = (
                 action.reason.trigger
                 if hasattr(action.reason, "trigger")
                 else (action.reason.get("trigger", str(action.reason)) if isinstance(action.reason, dict) else str(action.reason))
             )
             self.log(f"  Decision : {action.action_type} | trigger={trigger_next} | confidence={action.confidence:.2f} | next={action.parameters}")
+
+        # Final check for termination reason if not set
+        if self.termination_reason == "in_progress":
+            if self.actual_evaluations >= self.evaluation_budget or (self.time_budget and total_runtime >= self.time_budget):
+                self.termination_reason = "budget_exhausted"
+            else:
+                self.termination_reason = "agent_terminated"
 
         # ── Test set evaluation ──────────────────────────────────────────────
         self.log(f"\n  --- Test Set Evaluation (Best Validation Score: {best_val_score:.4f} from Iteration {best_iteration}) ---")
@@ -398,6 +533,8 @@ class ExecutionOrchestrator:
         budget_accounting = {
             "run_id": self.run_id,
             "configured_budget": {
+                "evaluation_budget": self.evaluation_budget,
+                "configured_budget": self.evaluation_budget,
                 "max_iterations": self.max_iterations,
                 "timeout_per_run_seconds": self.time_budget,
                 "tune": self.tune,
@@ -407,13 +544,17 @@ class ExecutionOrchestrator:
             "actual_consumption": {
                 "decision_iterations": self.decision_iterations,
                 "model_evaluations": self.actual_evaluations,
+                "actual_evaluations": self.actual_evaluations,
                 "model_fits": self.actual_fits,
+                "actual_fits": self.actual_fits,
                 "runtime_seconds": round(self.total_runtime, 4),
                 "timeout_triggered": bool(self.time_budget and self.total_runtime >= self.time_budget),
             },
+            "termination_reason": self.termination_reason,
             "paper_compliance": {
                 "is_paper_standard": (not self.tune),
                 "target_paper_config": {
+                    "evaluation_budget": self.evaluation_budget,
                     "max_iterations": 5,
                     "tune": False,
                 },
@@ -507,6 +648,8 @@ class ExecutionOrchestrator:
         resolved_exp_config = {
             "seed": self.split_config.random_seed,
             "budget": {
+                "evaluation_budget": self.evaluation_budget,
+                "configured_budget": self.evaluation_budget,
                 "max_iterations": self.max_iterations,
                 "timeout_per_run_seconds": self.time_budget,
                 "tune": self.tune,
@@ -565,6 +708,12 @@ class ExecutionOrchestrator:
             "dataset_fingerprint": getattr(profile, "dataset_fingerprint", None),
             "task": profile.problem_type,
             "seed": self.split_config.random_seed,
+            "evaluation_budget": self.evaluation_budget,
+            "configured_budget": self.evaluation_budget,
+            "actual_evaluations": self.actual_evaluations,
+            "actual_fits": self.actual_fits,
+            "decision_iterations": self.decision_iterations,
+            "termination_reason": self.termination_reason,
             "budget": self.budget_accounting,
             "model_space": list(
                 PAPER_REGRESSION_MODELS if profile.problem_type == "regression" else PAPER_CLASSIFICATION_MODELS

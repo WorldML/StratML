@@ -29,7 +29,12 @@ _DL_TEXT_MODELS     = ["TextCNN", "BiLSTM", "DistilBERT", "TinyBERT"]
 _DL_TABULAR_MODELS  = ["MLP", "CNN1D", "RNN", "ResidualMLP", "TabTransformer"]
 
 
-def build_experiment_config(action: ActionDecision, tune: bool = False, seed: int = 42) -> ExperimentConfig:
+def build_experiment_config(
+    action: ActionDecision,
+    tune: bool = False,
+    seed: int = 42,
+    max_evaluations: Optional[int] = None,
+) -> ExperimentConfig:
     """Build an executable ExperimentConfig from an ActionDecision."""
     params      = dict(action.parameters)
     action_type = action.action_type
@@ -118,4 +123,5 @@ def build_experiment_config(action: ActionDecision, tune: bool = False, seed: in
         early_stopping_patience=patience,
         tune=tune and not is_dl,
         seed=seed,
+        max_evaluations=max_evaluations,
     )

@@ -265,6 +265,8 @@ class StateResources(BaseModel):
     cpu_time: float
     remaining_budget: Optional[float] = None
     budget_exhausted: bool = False
+    actual_evaluations: int = 0
+    actual_fits: int = 0
 
 
 class StateSearch(BaseModel):
@@ -324,6 +326,7 @@ class StateConstraints(BaseModel):
     allowed_models: list[str]
     max_iterations: int
     time_budget: Optional[float] = None
+    evaluation_budget: Optional[int] = None
 
 
 class StateMeta(BaseModel):

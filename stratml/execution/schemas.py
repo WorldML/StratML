@@ -111,6 +111,8 @@ class ExperimentResult(BaseModel):
     best_epoch: Optional[int] = None       # epoch with lowest val loss (DL only)
     status: Optional[str] = None           # e.g. "completed" or "failed"
     failed: Optional[bool] = None          # True if run explicitly failed
+    eval_count: int = 1                    # number of candidate models evaluated in this iteration
+    fit_count: int = 1                     # number of underlying model fits executed
 
 
 class ActionDecision(BaseModel):
@@ -141,6 +143,7 @@ class ExperimentConfig(BaseModel):
     early_stopping_patience: int = 5
     tune: bool = False  # when True, ml_pipeline runs RandomizedSearchCV
     seed: int = 42
+    max_evaluations: Optional[int] = None  # ceiling on model evaluations for this run/iteration
 
 
 @dataclass

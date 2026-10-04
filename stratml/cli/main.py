@@ -46,8 +46,12 @@ def apply_cli_overrides(config, args):
     config = deepcopy(config)
     if getattr(args, "mode", None) is not None:
         config["mode"] = args.mode
+    if getattr(args, "budget", None) is not None:
+        config["execution"]["evaluation_budget"] = args.budget
+        config["execution"]["max_iterations"] = args.budget
     if getattr(args, "max_iter", None) is not None:
         config["execution"]["max_iterations"] = args.max_iter
+        config["execution"]["evaluation_budget"] = args.max_iter
     if getattr(args, "path", None) is not None:
         config["dataset"]["path"] = args.path
 
@@ -191,8 +195,11 @@ def run_pipeline(args):
     run_id  = f"{dataset_name}_{_dt.now(_tz.utc).strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
     out_dir = _Path("outputs") / run_id
 
+    eval_budget = e.get("evaluation_budget", e.get("max_iterations", 20))
+
     engine = DecisionEngine(
-        max_iterations=e["max_iterations"],
+        evaluation_budget=eval_budget,
+        max_iterations=eval_budget,
         time_budget=e.get("timeout_per_run"),
         allowed_models=allowed_models,
         run_id=run_id,
@@ -213,6 +220,10 @@ def run_pipeline(args):
         time_budget=e.get("timeout_per_run"),
         run_id=run_id,
         log=_log,
+        tune=e.get("tune", False),
+        evaluation_budget=eval_budget,
+        max_iterations=eval_budget,
+        resolved_config=config,
     )
 
     orchestrator.run(d["path"], d["target_column"])

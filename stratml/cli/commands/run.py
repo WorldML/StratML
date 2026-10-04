@@ -112,8 +112,11 @@ def run_pipeline(args) -> None:
     enable_meta_memory = abl_cfg.get("enable_meta_memory", True)
     enable_value_model = abl_cfg.get("enable_value_model", True)
 
+    eval_budget = e.get("evaluation_budget", e.get("max_iterations", 20))
+
     engine = DecisionEngine(
-        max_iterations=e["max_iterations"],
+        evaluation_budget=eval_budget,
+        max_iterations=eval_budget,
         time_budget=e.get("timeout_per_run"),
         allowed_models=allowed_models,
         run_id=run_id,
@@ -136,7 +139,8 @@ def run_pipeline(args) -> None:
         run_id=run_id,
         log=_console.print,
         tune=config.get("execution", {}).get("tune", False),
-        max_iterations=e.get("max_iterations", 5),
+        evaluation_budget=eval_budget,
+        max_iterations=eval_budget,
         resolved_config=config,
     )
     orchestrator.run(d["path"], d["target_column"])

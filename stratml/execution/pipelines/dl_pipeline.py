@@ -69,6 +69,8 @@ class DLPipelineResult:
     early_stopped: bool = False
     best_epoch: int = 0
     model_state: dict = field(default_factory=dict)
+    fit_count: int = 1
+    eval_count: int = 1
 
 
 # -- Main entry point ---------------------------------------------------------
