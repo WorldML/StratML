@@ -7,6 +7,7 @@ Budget enforcement lives here.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -23,7 +24,7 @@ from stratml.execution.pipelines.ml_pipeline import run_ml_pipeline
 from stratml.execution.result_builder import build_experiment_result
 from stratml.execution.schemas import (
     ActionDecision, ExperimentResult, DataProfile,
-    SplitConfig, ResourceUsage,
+    SplitConfig, ResourceUsage, CanonicalExperimentResult,
 )
 
 
@@ -58,6 +59,7 @@ class ExecutionOrchestrator:
         max_iterations: int | None = None,
         budget: int | None = None,
         resolved_config: Optional[dict] = None,
+        system: str = "stratml",
     ) -> None:
         self.send_profile  = send_profile
         self.send_result   = send_result
@@ -67,6 +69,7 @@ class ExecutionOrchestrator:
         self.log           = log or (lambda msg: None)
         self.enable_mlflow = enable_mlflow
         self.tune          = tune
+        self.system        = system
         # Canonical budget resolution: evaluation_budget > budget > max_iterations > default (20)
         if evaluation_budget is not None:
             self._evaluation_budget = int(evaluation_budget)
@@ -85,6 +88,12 @@ class ExecutionOrchestrator:
         self.termination_reason = "in_progress"
         self.budget_accounting: dict = {}
         self.manifest: dict | None = None
+        self.trajectory: list = []
+        self._seen_configs: set[str] = set()
+        self.repeated_configs: int = 0
+        self.best_val_score: Optional[float] = None
+        self.best_test_score: Optional[float] = None
+        self.result = None
 
     @property
     def evaluation_budget(self) -> int:
@@ -106,9 +115,9 @@ class ExecutionOrchestrator:
     def configured_budget(self) -> int:
         return self._evaluation_budget
 
-    def run(self, dataset_path: str, target_column: str) -> None:
+    def run(self, dataset_path: str, target_column: str) -> CanonicalExperimentResult:
         try:
-            self._run_internal(dataset_path, target_column)
+            return self._run_internal(dataset_path, target_column)
         except Exception:
             if self.termination_reason == "in_progress":
                 self.termination_reason = "execution_failure"
@@ -306,13 +315,21 @@ class ExecutionOrchestrator:
                 )
 
                 primary = getattr(metrics, primary_metric, None)
+                effective_goal = optimization_goal
                 if primary is None:
-                    primary = (
-                        metrics.accuracy
-                        if metrics.accuracy is not None
-                        else (metrics.r2 if metrics.r2 is not None else 0.0)
-                    )
-                is_best = is_better_score(primary, best_val_score, optimization_goal)
+                    if metrics.accuracy is not None:
+                        primary = metrics.accuracy
+                        effective_goal = "maximize"
+                    elif metrics.r2 is not None:
+                        primary = metrics.r2
+                        effective_goal = "maximize"
+                    else:
+                        primary = 0.0
+
+                if best_iteration is None:
+                    is_best = True
+                else:
+                    is_best = is_better_score(primary, best_val_score, effective_goal)
                 if is_best:
                     best_val_score = primary
                     best_config = config
@@ -368,6 +385,33 @@ class ExecutionOrchestrator:
                 eval_count=evals_this_iter,
                 fit_count=fits_this_iter,
             )
+
+            # Duplicate configuration accounting (Phase 2 & 3 compliance)
+            config_sig = f"{config.model_name}:{json.dumps(config.hyperparameters, sort_keys=True)}"
+            if config_sig in self._seen_configs:
+                self.repeated_configs += 1
+                is_duplicate = True
+            else:
+                self._seen_configs.add(config_sig)
+                is_duplicate = False
+
+            from stratml.core.schemas import TrajectoryStep
+            traj_step = TrajectoryStep(
+                evaluation=self.actual_evaluations,
+                iteration=iteration,
+                model_name=config.model_name,
+                hyperparameters=dict(config.hyperparameters),
+                validation_metrics=metrics.model_dump(exclude_none=True),
+                primary_metric=primary_metric,
+                primary_score=round(primary, 6) if primary is not None and primary not in (float("-inf"), float("inf")) else None,
+                runtime=run_time,
+                status="failed" if eval_failed else "completed",
+                cumulative_evaluations=self.actual_evaluations,
+                cumulative_fits=self.actual_fits,
+                repeated_config=is_duplicate,
+                decision_source=getattr(action.reason, "source", self.system) if hasattr(action, "reason") else self.system,
+            )
+            self.trajectory.append(traj_step)
 
             # ── Budget check (soft timeout) ───────────────────────────────────
             if self.time_budget and total_runtime >= self.time_budget:
@@ -456,8 +500,9 @@ class ExecutionOrchestrator:
                         else (test_metrics.r2 if test_metrics.r2 is not None else 0.0)
                     )
                 self.log(f"  Test metrics (best model {best_config.model_name}): primary={primary_test:.4f} ({primary_metric})")
+                self.best_test_score = primary_test
+                self.best_val_score = best_val_score if best_val_score not in (float("-inf"), float("inf")) else None
                 # Persist test metrics alongside the model artifacts
-                import json
                 test_metrics_path = Path("outputs") / self.run_id / "artifacts" / "test_metrics.json"
                 test_metrics_path.write_text(json.dumps(test_metrics.model_dump(), indent=2))
                 self.log(f"  Test metrics saved to {test_metrics_path}")
@@ -516,7 +561,8 @@ class ExecutionOrchestrator:
                             else (test_metrics.r2 if test_metrics.r2 is not None else 0.0)
                         )
                     self.log(f"  DL Test metrics: primary={primary_test:.4f} ({primary_metric})")
-                    import json
+                    self.best_test_score = primary_test
+                    self.best_val_score = best_val_score if best_val_score not in (float("-inf"), float("inf")) else None
                     test_metrics_path = Path("outputs") / self.run_id / "artifacts" / "test_metrics.json"
                     test_metrics_path.write_text(json.dumps(test_metrics.model_dump(), indent=2))
                     self.log(f"  Test metrics saved to {test_metrics_path}")
@@ -527,7 +573,6 @@ class ExecutionOrchestrator:
 
 
         # ── Computational Budget Accounting ──────────────────────────────────
-        import json
         artifacts_dir = Path("outputs") / self.run_id / "artifacts"
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         budget_accounting = {
@@ -547,6 +592,7 @@ class ExecutionOrchestrator:
                 "actual_evaluations": self.actual_evaluations,
                 "model_fits": self.actual_fits,
                 "actual_fits": self.actual_fits,
+                "repeated_configs": self.repeated_configs,
                 "runtime_seconds": round(self.total_runtime, 4),
                 "timeout_triggered": bool(self.time_budget and self.total_runtime >= self.time_budget),
             },
@@ -697,6 +743,7 @@ class ExecutionOrchestrator:
 
         manifest = {
             "manifest_version": "1.0",
+            "system": self.system,
             "run_id": self.run_id,
             "dataset": {
                 "name": profile.dataset_name,
@@ -707,6 +754,7 @@ class ExecutionOrchestrator:
             },
             "dataset_fingerprint": getattr(profile, "dataset_fingerprint", None),
             "task": profile.problem_type,
+            "task_type": task_type,
             "seed": self.split_config.random_seed,
             "evaluation_budget": self.evaluation_budget,
             "configured_budget": self.evaluation_budget,
@@ -714,6 +762,9 @@ class ExecutionOrchestrator:
             "actual_fits": self.actual_fits,
             "decision_iterations": self.decision_iterations,
             "termination_reason": self.termination_reason,
+            "best_validation_score": self.best_val_score,
+            "best_test_score": self.best_test_score,
+            "runtime": round(self.total_runtime, 4),
             "budget": self.budget_accounting,
             "model_space": list(
                 PAPER_REGRESSION_MODELS if profile.problem_type == "regression" else PAPER_CLASSIFICATION_MODELS
@@ -764,6 +815,31 @@ class ExecutionOrchestrator:
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         self.manifest = manifest
         self.log(f"  Experiment manifest saved to {manifest_path}")
+
+        # Persist trajectory log
+        traj_path = Path("outputs") / self.run_id / "decision_logs" / "trajectory.json"
+        traj_path.parent.mkdir(parents=True, exist_ok=True)
+        traj_path.write_text(json.dumps([t.model_dump() for t in self.trajectory], indent=2), encoding="utf-8")
+
+        from stratml.core.schemas import CanonicalExperimentResult
+        canonical_result = CanonicalExperimentResult(
+            system=self.system,
+            dataset=profile.dataset_name,
+            task_type=task_type,
+            seed=self.split_config.random_seed,
+            evaluation_budget=self.evaluation_budget,
+            actual_evaluations=self.actual_evaluations,
+            actual_fits=self.actual_fits,
+            decision_iterations=self.decision_iterations,
+            termination_reason=self.termination_reason,
+            best_validation_score=self.best_val_score,
+            best_test_score=self.best_test_score,
+            runtime=round(self.total_runtime, 4),
+            trajectory=self.trajectory,
+            manifest=manifest,
+        )
+        self.result = canonical_result
+        return canonical_result
 
     def _capture_start_snapshot(self, engine=None) -> dict:
         import hashlib

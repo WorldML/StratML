@@ -506,13 +506,14 @@ class TestUncertainty:
         est = estimate(predict(state, candidates), state)[0]
         assert 0.0 <= est.predicted_gain <= 1.0
 
-    def test_stub_confidence_is_half(self):
+    def test_stub_confidence_is_half(self, monkeypatch, tmp_path):
         """In stub mode (< 50 rows), confidence should be 0.5."""
-        from stratml.decision.learning.value_model import predict
+        from stratml.decision.learning import value_model
         from stratml.decision.learning.uncertainty import estimate
+        monkeypatch.setattr(value_model, "_DATASET_PATH", tmp_path / "nonexistent.csv")
         state = _make_state()
         candidates = [CandidateAction(action_type="switch_model", parameters={})]
-        est = estimate(predict(state, candidates), state)[0]
+        est = estimate(value_model.predict(state, candidates), state)[0]
         # Stub path: confidence=0.5, variance=0.0
         assert est.confidence == 0.5
         assert est.variance == 0.0
@@ -698,7 +699,7 @@ class TestEpsilonGreedy:
         monkeypatch.setattr(sel, "_EPSILON_LOW_DATA", 0.0)
         monkeypatch.setattr(sel, "_EPSILON_HIGH_DATA", 0.0)
         monkeypatch.setattr(sel, "_row_count", lambda: 0)
-        state = _make_state()
+        state = _make_state(well_fitted="none", underfitting="strong")
         ranked, decision = _full_pipeline(state)
         assert decision.action_type == ranked[0].action_type
 

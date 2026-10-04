@@ -64,6 +64,8 @@ from stratml.core.schemas import (  # noqa: F401
     ArtifactRefs,
     ExperimentResult,
     ActionDecision,
+    TrajectoryStep,
+    CanonicalExperimentResult,
 )
 class ExperimentMetrics(BaseModel):
     accuracy: Optional[float] = None

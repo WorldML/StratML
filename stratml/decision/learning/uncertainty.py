@@ -39,7 +39,9 @@ class UncertaintyEstimate:
 
 def estimate(predictions: list[ValuePrediction], state: "StateObject | None" = None) -> list[UncertaintyEstimate]:
     """Wrap each prediction with confidence/variance from ensemble when data is available."""
-    X_train, y_train = _load_training_data(_DATASET_PATH)
+    import stratml.decision.learning.value_model as _vm
+    dataset_path = getattr(_vm, "_DATASET_PATH", _DATASET_PATH)
+    X_train, y_train = _load_training_data(dataset_path)
 
     if X_train is not None:
         try:

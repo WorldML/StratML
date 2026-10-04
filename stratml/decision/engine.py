@@ -317,13 +317,27 @@ class DecisionEngine:
             "rmse" if self._profile and self._profile.problem_type == "regression" else "roc_auc"
         )
         current_score = getattr(result.metrics, metric_name, None)
+        effective_goal = self.optimization_goal
         if current_score is None:
-            current_score = (
-                getattr(result.metrics, "r2", None)
-                if metric_name in ("r2", "rmse")
-                else getattr(result.metrics, "accuracy", 0.0)
-            )
-        current_score = float(current_score or 0.0)
+            if metric_name in ("r2", "rmse", "mae", "mse"):
+                if getattr(result.metrics, "r2", None) is not None:
+                    current_score = result.metrics.r2
+                    effective_goal = "maximize"
+                elif getattr(result.metrics, "rmse", None) is not None:
+                    current_score = result.metrics.rmse
+                    effective_goal = "minimize"
+                else:
+                    current_score = 0.0
+            else:
+                if getattr(result.metrics, "accuracy", None) is not None:
+                    current_score = result.metrics.accuracy
+                    effective_goal = "maximize"
+                elif getattr(result.metrics, "f1_score", None) is not None:
+                    current_score = result.metrics.f1_score
+                    effective_goal = "maximize"
+                else:
+                    current_score = 0.0
+        current_score = float(current_score)
 
         # Determine action success/failure and separate execution status from action outcome (P0-27 & P1-27)
         is_failed = getattr(result, "failed", False) or getattr(result, "status", "") == "failed"
@@ -331,10 +345,10 @@ class DecisionEngine:
             execution_status = "failed"
             action_outcome = "failure"
             action_success = False
-            gain = compute_semantic_gain(current_score, self._last_best_score, self.optimization_goal) if self._last_best_score is not None else 0.0
+            gain = compute_semantic_gain(current_score, self._last_best_score, effective_goal) if self._last_best_score is not None else 0.0
         elif self._last_best_score is not None:
             execution_status = "completed"
-            gain = compute_semantic_gain(current_score, self._last_best_score, self.optimization_goal)
+            gain = compute_semantic_gain(current_score, self._last_best_score, effective_goal)
             if gain > 1e-6:
                 action_outcome = "improvement"
                 action_success = True
@@ -365,7 +379,7 @@ class DecisionEngine:
             )
 
         if not is_failed:
-            if self._best_val_score is None or is_better_score(current_score, self._best_val_score, self.optimization_goal):
+            if self._best_val_score is None or is_better_score(current_score, self._best_val_score, effective_goal):
                 self._best_val_score = current_score
                 self._best_model = result.model_name
                 self._last_best_score = current_score
@@ -550,7 +564,7 @@ class DecisionEngine:
         counterfactual.record(decision, runner_up)
 
         self._last_action         = decision.action_type
-        self._last_best_score     = state.trajectory.best_score
+        self._last_best_score     = self._best_val_score if self._best_val_score is not None else state.trajectory.best_score
         self._last_signals        = state.signals
         self._last_decision       = decision
 
@@ -567,11 +581,12 @@ class DecisionEngine:
             if self.enable_meta_memory and self._profile is not None:
                 meta = _extract_meta(self._profile)
                 best_model = self._best_model or (state.search.models_tried[-1] if state.search.models_tried else "unknown")
+                best_score_to_record = self._best_val_score if self._best_val_score is not None else state.trajectory.best_score
                 try:
                     _meta_memory.record_run(
                         meta,
                         best_model,
-                        state.trajectory.best_score,
+                        best_score_to_record,
                         self.run_id,
                         dataset_id=self._profile.dataset_name,
                         dataset_fingerprint=self._dataset_fingerprint,
@@ -580,7 +595,7 @@ class DecisionEngine:
                     _meta_memory.record_run(
                         meta,
                         best_model,
-                        state.trajectory.best_score,
+                        best_score_to_record,
                         self.run_id,
                     )
         return decision

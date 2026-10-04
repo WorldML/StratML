@@ -108,3 +108,10 @@ def compute_semantic_gain(
     if optimization_goal == "minimize":
         return round(float(baseline - current), 6)
     return round(float(current - baseline), 6)
+
+
+def get_metric_goal(metric_name: str) -> str:
+    """Return default optimization direction ('maximize' or 'minimize') for a given metric."""
+    if str(metric_name).lower() in ("log_loss", "rmse", "mae", "mse", "loss"):
+        return "minimize"
+    return "maximize"

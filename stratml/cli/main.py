@@ -353,7 +353,10 @@ def main():
 
     # ── run ───────────────────────────────────────────────────────────────────
     run = sub.add_parser("run", help="Run the AutoML pipeline")
-    run.add_argument("config")
+    run.add_argument("config", nargs="?", default="config.yaml", help="Path to config.yaml (optional if --path provided)")
+    run.add_argument("--system", choices=["stratml", "random_search"], default="stratml", help="AutoML system to run (stratml | random_search)")
+    run.add_argument("--budget", type=int, help="Model evaluation budget ceiling (e.g. 10 or 20)")
+    run.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     run.add_argument("--path")
     run.add_argument("--mode", choices=["beginner", "intermediate", "expert"])
     run.add_argument("--max-iter", type=int)

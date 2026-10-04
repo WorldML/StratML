@@ -51,7 +51,33 @@ class ExperimentHistory:
         buf = list(self._buffer)
         n = len(buf)
 
-        scores = [float(getattr(r.metrics, primary_metric, None) or 0.0) for r in buf]
+        effective_goal = optimization_goal
+        scores = []
+        for r in buf:
+            val = getattr(r.metrics, primary_metric, None)
+            if val is not None:
+                scores.append(float(val))
+            else:
+                if primary_metric in ("r2", "rmse", "mae", "mse"):
+                    if getattr(r.metrics, "r2", None) is not None:
+                        val = r.metrics.r2
+                        effective_goal = "maximize"
+                    elif getattr(r.metrics, "rmse", None) is not None:
+                        val = r.metrics.rmse
+                        effective_goal = "minimize"
+                    else:
+                        val = 0.0
+                else:
+                    if getattr(r.metrics, "accuracy", None) is not None:
+                        val = r.metrics.accuracy
+                        effective_goal = "maximize"
+                    elif getattr(r.metrics, "f1_score", None) is not None:
+                        val = r.metrics.f1_score
+                        effective_goal = "maximize"
+                    else:
+                        val = 0.0
+                scores.append(float(val))
+
         losses = [float(r.metrics.validation_loss or 0.0) for r in buf]
         runtimes = [r.runtime for r in buf]
 
@@ -59,7 +85,7 @@ class ExperimentHistory:
         prev = scores[-2] if n >= 2 else None
 
         if prev is not None:
-            if optimization_goal == "minimize":
+            if effective_goal == "minimize":
                 improvement_rate = round(prev - current, 6)
             else:
                 improvement_rate = round(current - prev, 6)
@@ -68,13 +94,13 @@ class ExperimentHistory:
 
         raw_slope = (scores[-1] - scores[0]) / max(n - 1, 1) if n >= 2 else 0.0
         slope = round(raw_slope, 6)
-        effective_slope = -slope if optimization_goal == "minimize" else slope
+        effective_slope = -slope if effective_goal == "minimize" else slope
 
         loss_slope = round((losses[-1] - losses[0]) / max(n - 1, 1), 6) if n >= 2 else 0.0
         runtime_trend = round(runtimes[-1] - runtimes[-2], 4) if n >= 2 else 0.0
         volatility = round(stdev(scores), 6) if n >= 2 else 0.0
 
-        if optimization_goal == "minimize":
+        if effective_goal == "minimize":
             best_score = min(scores) if scores else 0.0
         else:
             best_score = max(scores) if scores else 0.0
@@ -84,10 +110,10 @@ class ExperimentHistory:
         if self._best_score is None:
             self._best_score = current
             self._steps_since_improvement = 0
-        elif optimization_goal == "minimize" and current < self._best_score - 1e-6:
+        elif effective_goal == "minimize" and current < self._best_score - 1e-6:
             self._best_score = current
             self._steps_since_improvement = 0
-        elif optimization_goal == "maximize" and current > self._best_score + 1e-6:
+        elif effective_goal == "maximize" and current > self._best_score + 1e-6:
             self._best_score = current
             self._steps_since_improvement = 0
         else:

@@ -128,7 +128,14 @@ class TestActionGenerator:
 
     def test_converged_well_fitted_returns_terminate(self):
         from stratml.decision.actions.action_generator import generate
-        state = _make_state(converged="strong", well_fitted="strong")
+        models = ["LogisticRegression", "RandomForest", "GradientBoosting", "SVC"]
+        state = _make_state(
+            converged="strong",
+            well_fitted="strong",
+            iteration=2,
+            allowed_models=models,
+            models_tried=models,
+        )
         candidates = generate(state)
         assert candidates[0].action_type == "terminate"
         assert len(candidates) == 1

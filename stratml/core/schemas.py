@@ -126,8 +126,8 @@ class BootstrapContext(BaseModel):
 class DecisionReason(BaseModel):
     trigger: str
     evidence: dict = Field(default_factory=dict)
-    source: str = Field(default="rule", pattern="^(bootstrap|rule|llm|value_model|hybrid|fallback|learned)$")
-    selection_mode: Optional[str] = Field(default="greedy", pattern="^(greedy|epsilon_exploration|bootstrap|fallback)$")
+    source: str = Field(default="rule", pattern="^(bootstrap|rule|llm|value_model|hybrid|fallback|learned|random_search)$")
+    selection_mode: Optional[str] = Field(default="greedy", pattern="^(greedy|epsilon_exploration|bootstrap|fallback|random)$")
     fallback_participation: Optional[bool] = False
 
 
@@ -388,3 +388,47 @@ class DecisionRecord(BaseModel):
 
 DecisionRecord.model_rebuild()
 StateObject.model_rebuild()
+
+
+# ---------------------------------------------------------------------------
+# Cross-system: TrajectoryStep & CanonicalExperimentResult
+# ---------------------------------------------------------------------------
+
+class TrajectoryStep(BaseModel):
+    evaluation: int
+    iteration: int
+    model_name: str
+    hyperparameters: dict = Field(default_factory=dict)
+    validation_metrics: dict = Field(default_factory=dict)
+    primary_metric: Optional[str] = None
+    primary_score: Optional[float] = None
+    runtime: float = 0.0
+    status: str = "completed"
+    cumulative_evaluations: int = 1
+    cumulative_fits: int = 1
+    repeated_config: bool = False
+    decision_source: str = "random_search"
+
+
+class CanonicalExperimentResult(BaseModel):
+    system: str
+    dataset: str
+    task_type: str
+    seed: int
+    evaluation_budget: int
+    actual_evaluations: int
+    actual_fits: int
+    decision_iterations: int
+    termination_reason: str
+    best_validation_score: Optional[float] = None
+    best_test_score: Optional[float] = None
+    runtime: float
+    trajectory: list[TrajectoryStep] = Field(default_factory=list)
+    manifest: dict = Field(default_factory=dict)
+
+    def __getitem__(self, item: str) -> Any:
+        return getattr(self, item)
+
+    def get(self, item: str, default: Any = None) -> Any:
+        return getattr(self, item, default)
+

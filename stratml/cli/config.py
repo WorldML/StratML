@@ -12,9 +12,10 @@ import yaml
 from copy import deepcopy
 
 DEFAULT_CONFIG: dict = {
+    "system": "stratml",
     "mode": "beginner",
     "dataset": {"path": None, "target_column": None},
-    "execution": {"evaluation_budget": 20, "max_iterations": 5, "timeout_per_run": 300, "random_seed": 42, "tune": False},
+    "execution": {"system": "stratml", "evaluation_budget": 20, "max_iterations": 5, "timeout_per_run": 300, "random_seed": 42, "tune": False},
     "split": {"method": "stratified", "test_size": 0.2},
     "logging": {"enable_mlflow": False, "enable_tensorboard": False, "log_level": "info"},
     "constraints": {"max_memory": None, "max_cpu": None},
@@ -54,6 +55,12 @@ def deep_merge(base: dict, override: dict) -> dict:
 
 def apply_cli_overrides(config: dict, args) -> dict:
     config = deepcopy(config)
+    if getattr(args, "system", None) is not None:
+        config["system"] = args.system
+        config["execution"]["system"] = args.system
+    if getattr(args, "seed", None) is not None:
+        config["execution"]["random_seed"] = args.seed
+        config["split"]["random_seed"] = args.seed
     if getattr(args, "mode", None) is not None:
         config["mode"] = args.mode
     if getattr(args, "budget", None) is not None:
@@ -126,9 +133,13 @@ def enforce_mode_rules(config: dict) -> dict:
     return config
 
 
-def resolve(yaml_path: str, args) -> dict:
+def resolve(yaml_path: str | None, args) -> dict:
     """Full config resolution pipeline: load → merge → overrides → validate."""
-    config = deep_merge(DEFAULT_CONFIG, load_yaml(yaml_path))
-    config = apply_cli_overrides(config, args)
+    from pathlib import Path
+    if yaml_path and Path(yaml_path).exists():
+        base = deep_merge(DEFAULT_CONFIG, load_yaml(yaml_path))
+    else:
+        base = deepcopy(DEFAULT_CONFIG)
+    config = apply_cli_overrides(base, args)
     config = enforce_mode_rules(config)
     return config

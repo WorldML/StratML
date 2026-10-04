@@ -165,7 +165,8 @@ class TestP0_4_TaskAndMetricAdaptation:
         reg_profile = _make_dummy_profile(problem_type="regression")
         decision = engine.receive_profile(reg_profile)
 
-        assert engine.primary_metric == "r2"
+        assert engine.primary_metric == "rmse"
+        assert engine.optimization_goal == "minimize"
         # First decision should select a regression model, not a classifier
         assert "Regressor" in decision.parameters["model_name"] or decision.parameters["model_name"] in ["Ridge", "Lasso", "ElasticNet", "LinearRegression"]
 
@@ -174,7 +175,7 @@ class TestP0_4_TaskAndMetricAdaptation:
         clf_profile = _make_dummy_profile(problem_type="classification")
         decision = engine.receive_profile(clf_profile)
 
-        assert engine.primary_metric == "accuracy"
+        assert engine.primary_metric in ("roc_auc", "log_loss")
         assert "Classifier" in decision.parameters["model_name"] or decision.parameters["model_name"] in ["LogisticRegression", "GaussianNB"]
 
 

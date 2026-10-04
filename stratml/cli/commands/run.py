@@ -113,19 +113,30 @@ def run_pipeline(args) -> None:
     enable_value_model = abl_cfg.get("enable_value_model", True)
 
     eval_budget = e.get("evaluation_budget", e.get("max_iterations", 20))
+    system = config.get("system", config.get("execution", {}).get("system", "stratml"))
 
-    engine = DecisionEngine(
-        evaluation_budget=eval_budget,
-        max_iterations=eval_budget,
-        time_budget=e.get("timeout_per_run"),
-        allowed_models=allowed_models,
-        run_id=run_id,
-        dl_hyperparams=dl_hyperparams,
-        seed=seed,
-        llm_mode=config.get("llm_mode", e.get("llm_mode")),
-        enable_meta_memory=enable_meta_memory,
-        enable_value_model=enable_value_model,
-    )
+    if system == "random_search":
+        from stratml.baselines.random_search import RandomSearchEngine
+        engine = RandomSearchEngine(
+            evaluation_budget=eval_budget,
+            seed=seed,
+            run_id=run_id,
+            time_budget=e.get("timeout_per_run"),
+            allowed_models=allowed_models,
+        )
+    else:
+        engine = DecisionEngine(
+            evaluation_budget=eval_budget,
+            max_iterations=eval_budget,
+            time_budget=e.get("timeout_per_run"),
+            allowed_models=allowed_models,
+            run_id=run_id,
+            dl_hyperparams=dl_hyperparams,
+            seed=seed,
+            llm_mode=config.get("llm_mode", e.get("llm_mode")),
+            enable_meta_memory=enable_meta_memory,
+            enable_value_model=enable_value_model,
+        )
 
     orchestrator = ExecutionOrchestrator(
         send_profile=engine.receive_profile,
@@ -142,6 +153,7 @@ def run_pipeline(args) -> None:
         evaluation_budget=eval_budget,
         max_iterations=eval_budget,
         resolved_config=config,
+        system=system,
     )
     orchestrator.run(d["path"], d["target_column"])
 
